@@ -44,7 +44,7 @@ As AI agents become capable of finding products, booking services, and negotiati
          ▼                       ▼
 ┌─────────────────┐     ┌──────────────────┐
 │    Supabase     │     │ Cloudflare AI    │
-│  DB + Auth +    │     │ Llama 3.1 70B    │
+│  DB + Auth +    │     │ Llama 3.3 70B    │
 │  Realtime       │     │ (Free Tier)      │
 └─────────────────┘     └──────────────────┘
 ```
@@ -58,7 +58,7 @@ As AI agents become capable of finding products, booking services, and negotiati
 | **Frontend** | Next.js 14 + React + Tailwind CSS |
 | **Backend** | Python FastAPI |
 | **Database** | Supabase (PostgreSQL + Auth + Realtime) |
-| **AI Agent** | Cloudflare Workers AI — Llama 3.1 70B Instruct |
+| **AI Agent** | Cloudflare Workers AI — Llama 3.3 70B Instruct (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`) |
 | **Payments** | PayPal Python SDK (`paypal-server-sdk`) |
 
 ---

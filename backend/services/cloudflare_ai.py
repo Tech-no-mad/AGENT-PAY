@@ -11,6 +11,8 @@ from typing import Any, Optional
 
 import httpx
 
+from backend.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Maximum retries for transient failures
@@ -21,10 +23,15 @@ _RETRY_BACKOFF = [1.0, 2.0, 4.0]
 class CloudflareAI:
     """Async wrapper around the Cloudflare Workers AI REST API."""
 
-    def __init__(self, account_id: str, api_token: str) -> None:
+    def __init__(
+        self,
+        account_id: str,
+        api_token: str,
+        model: Optional[str] = None,
+    ) -> None:
         self.account_id = account_id
         self.api_token = api_token
-        self.model = "@cf/meta/llama-3.1-70b-instruct"
+        self.model = model or settings.CLOUDFLARE_MODEL or "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
         self._base_url = (
             f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{self.model}"
         )
