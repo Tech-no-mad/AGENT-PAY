@@ -27,7 +27,7 @@ const eventBadgeConfig: Record<
     text: "text-blue-400",
     icon: Clock,
   },
-  SEARCH_PRODUCTS: {
+  SEARCH_STARTED: {
     label: "Catalog Search",
     bg: "bg-yellow-500/10 border-yellow-500/20",
     text: "text-yellow-400",
@@ -51,7 +51,7 @@ const eventBadgeConfig: Record<
     text: "text-purple-400",
     icon: CreditCard,
   },
-  PAYMENT_AUTHORIZED: {
+  AUTHORIZED: {
     label: "Hold Authorized",
     bg: "bg-purple-500/10 border-purple-500/20",
     text: "text-purple-400",
@@ -81,7 +81,7 @@ const eventBadgeConfig: Record<
     text: "text-gray-400",
     icon: XCircle,
   },
-  MANDATE_FAILED: {
+  FAILED: {
     label: "Failed",
     bg: "bg-red-500/10 border-red-500/20",
     text: "text-red-400",
@@ -114,7 +114,7 @@ export default function HistoryPage() {
     const q = search.toLowerCase();
     return (
       tx.event_type.toLowerCase().includes(q) ||
-      (tx.paypal_order_id && tx.paypal_order_id.toLowerCase().includes(q)) ||
+      (tx.paypal_resource_id && tx.paypal_resource_id.toLowerCase().includes(q)) ||
       (tx.mandate_id && tx.mandate_id.toLowerCase().includes(q)) ||
       (tx.details && JSON.stringify(tx.details).toLowerCase().includes(q))
     );
@@ -184,7 +184,7 @@ export default function HistoryPage() {
               </thead>
               <tbody className="divide-y divide-gray-800/60">
                 {filtered.map((tx) => {
-                  const badge = eventBadgeConfig[tx.event_type] || {
+                  const badge = eventBadgeConfig[tx.details?.original_event] || eventBadgeConfig[tx.event_type.toUpperCase()] || {
                     label: tx.event_type,
                     bg: "bg-gray-800",
                     text: "text-gray-300",
@@ -229,12 +229,8 @@ export default function HistoryPage() {
                       </td>
 
                       <td className="py-3 px-4 font-mono text-[11px] text-gray-400">
-                        {tx.paypal_capture_id ? (
-                          <span className="text-green-400">Cap: {tx.paypal_capture_id.slice(0, 10)}...</span>
-                        ) : tx.paypal_authorization_id ? (
-                          <span className="text-purple-400">Auth: {tx.paypal_authorization_id.slice(0, 10)}...</span>
-                        ) : tx.paypal_order_id ? (
-                          <span className="text-sky-400">Ord: {tx.paypal_order_id.slice(0, 10)}...</span>
+                        {tx.paypal_resource_id ? (
+                          <span className="text-sky-400">{tx.paypal_resource_id.slice(0, 10)}...</span>
                         ) : (
                           "—"
                         )}

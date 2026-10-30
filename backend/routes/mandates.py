@@ -16,6 +16,8 @@ from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.cloudflare_ai import CloudflareAI
 from backend.services.mandate_service import MandateService
 from backend.services.paypal_service import PayPalService
+from backend.services.mandate_lifecycle import CancellationFailed, CancellationPending
+from backend.services.supabase_client import AuditLogError
 from backend.services.supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
@@ -55,7 +57,7 @@ async def create_mandate(
     agent is kicked off in the background.
     """
     try:
-        constraints_dict = payload.constraints.model_dump(exclude_none=True) if payload.constraints else None
+        constraints_dict = payload.constraints.model_dump(exclude_unset=True, exclude_none=True) if payload.constraints else None
         mandate = await service.create_mandate(
             user_id=current_user["id"],
             description=payload.description,
@@ -115,7 +117,12 @@ async def cancel_mandate(
     Cancel an active mandate. If funds are currently authorized on PayPal,
     the authorization is automatically voided.
     """
-    cancelled = await service.cancel_mandate(mandate_id, current_user["id"])
+    try:
+        cancelled = await service.cancel_mandate(mandate_id, current_user["id"])
+    except CancellationPending as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (CancellationFailed, AuditLogError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not cancelled:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

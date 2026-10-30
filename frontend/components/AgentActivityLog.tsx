@@ -41,6 +41,11 @@ const eventColors: Record<string, string> = {
 
 function getEventKey(eventType: string): string {
   const lower = eventType.toLowerCase();
+  const canonical: Record<string, string> = {
+    policy_approved: "evaluate", policy_rejected: "error", captured: "complete",
+    voided: "cancel", failed: "error", order_created: "payment",
+  };
+  if (canonical[lower]) return canonical[lower];
   for (const key of Object.keys(eventIcons)) {
     if (lower.includes(key)) return key;
   }
@@ -110,7 +115,7 @@ export default function AgentActivityLog({
                   {formatTime(tx.created_at)}
                 </span>
               </div>
-              <p className="text-sm text-gray-400">{tx.details}</p>
+              <p className="text-sm text-gray-400">{tx.details ? JSON.stringify(tx.details) : ""}</p>
               {tx.amount && (
                 <p className="text-sm text-primary-400 mt-1 font-medium">
                   ${tx.amount.toFixed(2)}

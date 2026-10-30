@@ -6,6 +6,7 @@ can bypass RLS for mandate / transaction management.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -69,9 +70,11 @@ def update_mandate_status(
     mandate_id: str,
     status: str,
     extra_fields: Optional[dict[str, Any]] = None,
+    *,
+    supabase_client: Any = None,
 ) -> Optional[dict[str, Any]]:
     """Update mandate status (and optional extra columns)."""
-    sb = get_supabase()
+    sb = supabase_client if supabase_client is not None else get_supabase()
     payload: dict[str, Any] = {
         "status": status,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -80,16 +83,36 @@ def update_mandate_status(
         payload.update(extra_fields)
 
     try:
-        result = sb.table("mandates").update(payload).eq("id", mandate_id).execute()
+        allowed = ["active", "searching", "evaluating"]
+        if status not in ("searching", "evaluating"):
+            allowed.append("authorized")
+        result = (sb.table("mandates").update(payload).eq("id", mandate_id)
+                  .in_("status", allowed).eq("cancel_requested", False)
+                  .is_("payment_operation_id", "null").execute())
         return result.data[0] if result.data else None
     except Exception as exc:
         logger.error("Failed to update mandate %s to %s: %s", mandate_id, status, exc)
-        return None
+        raise
 
 
 # ---------------------------------------------------------------------------
 # Transaction helpers
 # ---------------------------------------------------------------------------
+
+class AuditLogError(RuntimeError):
+    """Required audit persistence failed; callers must surface the failure."""
+
+
+_EVENT_NAMES = {
+    "MANDATE_CREATED": "mandate_created", "PRODUCT_SEARCH": "search_started",
+    "ORDER_CREATED": "order_created", "ORDER_AUTHORIZED": "authorized",
+    "PAYMENT_AUTHORIZED": "authorized", "PAYMENT_CAPTURED": "captured",
+    "AUTHORIZATION_VOIDED": "voided", "PAYMENT_REFUNDED": "refunded",
+    "ORDER_FAILED": "failed", "CAPTURE_FAILED": "failed", "CAPTURE_DENIED": "failed",
+    "MANDATE_FAILED": "failed", "MANDATE_COMPLETED": "captured", "MANDATE_CANCELLED": "voided",
+}
+_SCHEMA_EVENTS = {"mandate_created", "search_started", "deal_found", "policy_approved", "policy_rejected",
+                  "order_created", "authorized", "captured", "voided", "failed", "refunded"}
 
 def log_transaction(
     mandate_id: str,
@@ -102,24 +125,45 @@ def log_transaction(
     currency: Optional[str] = None,
     status: Optional[str] = None,
     details: Optional[dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+    supabase_client: Any = None,
 ) -> Optional[dict[str, Any]]:
-    """Insert a row into the transactions table."""
-    sb = get_supabase()
-    row: dict[str, Any] = {
-        "mandate_id": mandate_id,
-        "event_type": event_type,
-        "paypal_order_id": paypal_order_id,
-        "paypal_authorization_id": paypal_authorization_id,
-        "paypal_capture_id": paypal_capture_id,
-        "amount": amount,
-        "currency": currency,
-        "status": status,
-        "details": details,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    """Write the migration's exact audit contract, retaining metadata in details."""
     try:
+        sb = supabase_client if supabase_client is not None else get_supabase()
+        if not user_id:
+            mandate = sb.table("mandates").select("user_id").eq("id", mandate_id).maybe_single().execute().data
+            if not mandate:
+                raise ValueError("Cannot determine the mandate's audit owner")
+            user_id = mandate["user_id"]
+        if event_type == "POLICY_CHECK":
+            if status not in ("APPROVED", "REJECTED"):
+                raise ValueError("Policy audit requires an explicit decision")
+            normalized = "policy_approved" if status == "APPROVED" else "policy_rejected"
+        else:
+            normalized = _EVENT_NAMES.get(event_type, event_type.lower())
+        if normalized not in _SCHEMA_EVENTS:
+            raise ValueError(f"Unsupported audit event: {event_type}")
+        metadata = dict(details or {})
+        metadata["original_event"] = event_type
+        if amount is not None and (isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount)):
+            metadata["submitted_amount"] = str(amount)
+            amount = None
+        for key, value in {"status": status, "paypal_order_id": paypal_order_id,
+                           "paypal_authorization_id": paypal_authorization_id,
+                           "paypal_capture_id": paypal_capture_id}.items():
+            if value is not None:
+                metadata[key] = value
+        row = {
+            "mandate_id": mandate_id, "user_id": user_id, "event_type": normalized,
+            "paypal_resource_id": paypal_capture_id or paypal_authorization_id or paypal_order_id,
+            "amount": amount, "currency": currency or "USD", "details": metadata,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
         result = sb.table("transactions").insert(row).execute()
-        return result.data[0] if result.data else None
+        if not result.data:
+            raise RuntimeError("Audit insert returned no persisted row")
+        return result.data[0]
     except Exception as exc:
-        logger.error("Failed to log transaction for mandate %s: %s", mandate_id, exc)
-        return None
+        logger.exception("Audit persistence failed for mandate %s", mandate_id)
+        raise AuditLogError(f"Audit persistence failed for mandate {mandate_id}") from exc

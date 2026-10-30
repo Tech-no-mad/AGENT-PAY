@@ -178,13 +178,11 @@ export async function cancelMandate(
 export interface Transaction {
   id: string;
   mandate_id: string;
+  user_id: string;
   event_type: string;
-  paypal_order_id?: string;
-  paypal_authorization_id?: string;
-  paypal_capture_id?: string;
+  paypal_resource_id?: string;
   amount?: number;
   currency?: string;
-  status?: string;
   details?: Record<string, any>;
   created_at: string;
 }

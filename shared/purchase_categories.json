@@ -1,0 +1,27 @@
+{
+  "physical_goods": {
+    "label": "Physical Goods / Electronics",
+    "aliases": ["product", "products", "physical goods"],
+    "includes": ["physical_goods", "general", "electronics", "clothing", "books", "home", "sports"]
+  },
+  "flights": {
+    "label": "Flight / Travel",
+    "aliases": ["flight"],
+    "includes": ["flights"]
+  },
+  "services": {
+    "label": "Digital Service / Subscription",
+    "aliases": ["service", "subscription", "subscriptions", "digital service"],
+    "includes": ["services"]
+  },
+  "hotels": {
+    "label": "Hotel / Accommodation",
+    "aliases": ["hotel", "accommodation"],
+    "includes": ["hotels"]
+  },
+  "food": {
+    "label": "Food / Groceries",
+    "aliases": ["groceries"],
+    "includes": ["food"]
+  }
+}

@@ -8,6 +8,7 @@ token for Vault v3 endpoints not yet exposed by the SDK.
 from __future__ import annotations
 
 import logging
+from uuid import NAMESPACE_URL, uuid5
 from typing import Any, Optional
 
 import httpx
@@ -155,6 +156,7 @@ class PayPalService:
         description: str,
         payment_token_id: str,
         mandate_id: str,
+        request_id: Optional[str] = None,
     ) -> Any:
         """Create an order with AUTHORIZE intent using a vaulted payment token."""
         order_body = OrderRequest(
@@ -177,28 +179,28 @@ class PayPalService:
             ),
         )
         try:
-            result = self._orders_controller.orders_create({"body": order_body})
+            result = self._orders_controller.orders_create({"body": order_body, "paypal_request_id": request_id})
             logger.info("Order created: %s", result.body.id if result.body else "unknown")
             return result.body
         except Exception as exc:
             logger.error("Failed to create order: %s", exc)
             raise
 
-    def authorize_order(self, order_id: str) -> Any:
+    def authorize_order(self, order_id: str, request_id: Optional[str] = None) -> Any:
         """Authorize a created order."""
         try:
-            result = self._orders_controller.orders_authorize({"id": order_id})
+            result = self._orders_controller.orders_authorize({"id": order_id, "paypal_request_id": request_id})
             logger.info("Order authorized: %s", order_id)
             return result.body
         except Exception as exc:
             logger.error("Failed to authorize order %s: %s", order_id, exc)
             raise
 
-    def capture_authorization(self, authorization_id: str) -> Any:
+    def capture_authorization(self, authorization_id: str, request_id: Optional[str] = None) -> Any:
         """Capture a previously authorized payment."""
         try:
             result = self._payments_controller.authorizations_capture(
-                {"authorization_id": authorization_id}
+                {"authorization_id": authorization_id, "paypal_request_id": request_id}
             )
             logger.info("Authorization captured: %s", authorization_id)
             return result.body
@@ -210,13 +212,18 @@ class PayPalService:
         """Void (release) an authorization."""
         try:
             result = self._payments_controller.authorizations_void(
-                {"authorization_id": authorization_id}
+                {"authorization_id": authorization_id,
+                 "paypal_request_id": str(uuid5(NAMESPACE_URL, f"agentpay:void:{authorization_id}"))}
             )
             logger.info("Authorization voided: %s", authorization_id)
             return result.body
         except Exception as exc:
             logger.error("Failed to void authorization %s: %s", authorization_id, exc)
             raise
+
+    def get_authorization(self, authorization_id: str) -> Any:
+        """Reconcile an ambiguous void without falsely confirming released funds."""
+        return self._payments_controller.authorizations_get(authorization_id).body
 
     def get_order(self, order_id: str) -> Any:
         """Get order details."""

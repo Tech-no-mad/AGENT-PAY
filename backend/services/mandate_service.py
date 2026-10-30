@@ -8,9 +8,12 @@ import asyncio
 import logging
 from typing import Any, Optional
 
+from backend.models.schemas import MandateConstraints
+
 from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.cloudflare_ai import CloudflareAI
-from backend.services.supabase_client import get_supabase, log_transaction, update_mandate_status, resolve_payment_token
+from backend.services.mandate_lifecycle import MandateLifecycle
+from backend.services.supabase_client import log_transaction, update_mandate_status, resolve_payment_token
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +30,7 @@ class MandateService:
         self.sb = supabase_client
         self.orchestrator = agent_orchestrator
         self.ai = cloudflare_ai
+        self.lifecycle = MandateLifecycle(self.sb, self.orchestrator.paypal)
 
     # ------------------------------------------------------------------
     # CRUD
@@ -40,14 +44,17 @@ class MandateService:
         constraints: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
-        Create a new mandate, parse constraints via AI if not provided,
+        Parse instructions, merge explicit overrides, validate the mandate,
         and kick off the agent execution in the background.
         """
         resolve_payment_token(self.sb, payment_token_id, user_id)
 
-        # Parse constraints from natural language if not explicitly provided
-        if not constraints:
-            constraints = await self.ai.parse_mandate(description)
+        parsed = await self.ai.parse_mandate(description)
+        constraints = MandateConstraints.model_validate({
+            **parsed, **{key: value for key, value in (constraints or {}).items() if value is not None},
+        }).model_dump()
+        if constraints["max_price"] is None:
+            raise ValueError("A positive budget is required in the instructions or explicit constraints")
 
         mandate_row = {
             "user_id": user_id,
@@ -66,8 +73,10 @@ class MandateService:
         log_transaction(
             mandate_id=mandate_id,
             event_type="MANDATE_CREATED",
-            status="pending",
+            status="active",
             details={"description": description},
+            user_id=user_id,
+            supabase_client=self.sb,
         )
 
         # Fire-and-forget: kick off agent execution in the background
@@ -85,6 +94,7 @@ class MandateService:
                 mandate.get("id", ""),
                 "failed",
                 {"agent_reasoning": f"Background execution error: {exc}"},
+                supabase_client=self.sb,
             )
 
     async def get_mandates(self, user_id: str) -> list[dict[str, Any]]:
@@ -118,35 +128,7 @@ class MandateService:
         if not mandate:
             return None
 
-        current_status = mandate.get("status", "")
-        if current_status in ("completed", "cancelled", "failed"):
-            logger.warning("Cannot cancel mandate %s — already %s", mandate_id, current_status)
-            return mandate
-
-        # Void authorization if one exists
-        authorization_id = mandate.get("paypal_authorization_id")
-        if authorization_id:
-            try:
-                from backend.services.paypal_service import PayPalService
-                paypal = PayPalService()
-                paypal.void_authorization(authorization_id)
-                log_transaction(
-                    mandate_id=mandate_id,
-                    event_type="AUTHORIZATION_VOIDED",
-                    paypal_authorization_id=authorization_id,
-                    status="voided",
-                    details={"reason": "mandate_cancelled"},
-                )
-            except Exception as exc:
-                logger.error("Failed to void authorization %s: %s", authorization_id, exc)
-
-        updated = update_mandate_status(mandate_id, "cancelled")
-        log_transaction(
-            mandate_id=mandate_id,
-            event_type="MANDATE_CANCELLED",
-            status="cancelled",
-        )
-        return updated
+        return self.lifecycle.cancel(mandate_id, user_id)
 
     # ------------------------------------------------------------------
     # Status transitions
@@ -155,18 +137,18 @@ class MandateService:
     async def mark_completed(self, mandate_id: str, details: Optional[dict[str, Any]] = None) -> None:
         """Transition mandate to completed status."""
         extra = details or {}
-        update_mandate_status(mandate_id, "completed", extra)
-        log_transaction(mandate_id=mandate_id, event_type="MANDATE_COMPLETED", status="completed", details=extra)
+        update_mandate_status(mandate_id, "completed", extra, supabase_client=self.sb)
+        log_transaction(mandate_id=mandate_id, event_type="MANDATE_COMPLETED", status="completed", details=extra, supabase_client=self.sb)
 
     async def mark_cancelled(self, mandate_id: str, reason: str = "") -> None:
-        """Transition mandate to cancelled status."""
-        update_mandate_status(mandate_id, "cancelled", {"agent_reasoning": reason} if reason else None)
-        log_transaction(mandate_id=mandate_id, event_type="MANDATE_CANCELLED", status="cancelled", details={"reason": reason})
+        """Use the same confirmed-release path as user and agent cancellation."""
+        mandate = self.lifecycle.current(mandate_id)
+        self.lifecycle.cancel(mandate_id, mandate["user_id"])
 
     async def mark_failed(self, mandate_id: str, error: str = "") -> None:
         """Transition mandate to failed status."""
-        update_mandate_status(mandate_id, "failed", {"agent_reasoning": error} if error else None)
-        log_transaction(mandate_id=mandate_id, event_type="MANDATE_FAILED", status="failed", details={"error": error})
+        update_mandate_status(mandate_id, "failed", {"agent_reasoning": error} if error else None, supabase_client=self.sb)
+        log_transaction(mandate_id=mandate_id, event_type="MANDATE_FAILED", status="failed", details={"error": error}, supabase_client=self.sb)
 
     # ------------------------------------------------------------------
     # Transactions

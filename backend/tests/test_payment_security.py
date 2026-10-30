@@ -15,6 +15,8 @@ from backend.services import supabase_client as db
 from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.mandate_service import MandateService
 from backend.services.paypal_service import PayPalService
+from backend.services.mandate_lifecycle import PaymentOutcomeUnknown
+from backend.tests.fake_supabase import FakeSupabase
 
 
 def run(coroutine):
@@ -29,9 +31,9 @@ def mandate():
 
 
 @pytest.fixture
-def agent():
-    instance = AgentOrchestrator(AsyncMock(), MagicMock(), MagicMock())
-    with patch("backend.services.agent_orchestrator.update_mandate_status"), patch("backend.services.agent_orchestrator.log_transaction"):
+def agent(mandate):
+    instance = AgentOrchestrator(AsyncMock(), MagicMock(), FakeSupabase(mandate))
+    with patch("backend.services.agent_orchestrator.log_transaction"), patch("backend.services.mandate_lifecycle.log_transaction"):
         yield instance
 
 
@@ -73,12 +75,15 @@ def authorized_order():
 def test_valid_purchase_resolves_vault_identifier_and_persists_schema(agent, mandate):
     agent.paypal.create_authorized_order.return_value = authorized_order()
     result = {}
-    with patch("backend.services.agent_orchestrator.resolve_payment_token", return_value={"paypal_token_id": "vault-id"}) as resolve, patch("backend.services.agent_orchestrator.update_mandate_status") as update:
+    with patch("backend.services.agent_orchestrator.resolve_payment_token", return_value={"paypal_token_id": "vault-id"}) as resolve:
         run(agent._create_order(purchase(), mandate, result))
     resolve.assert_called_once_with(agent.sb, "db-token", "buyer")
     assert agent.paypal.create_authorized_order.call_args.kwargs["payment_token_id"] == "vault-id"
     assert result["status"] == "authorized"
-    assert update.call_args.args[2] == {"paypal_order_id": "order", "paypal_authorization_id": "owned-auth", "executed_amount": 50}
+    stored = agent.lifecycle.current(mandate["id"])
+    assert stored["paypal_order_id"] == "order"
+    assert stored["paypal_authorization_id"] == "owned-auth"
+    assert stored["executed_amount"] == 50
     assert "error" in run(agent._create_order(purchase(), mandate, result))
     assert agent.paypal.create_authorized_order.call_count == 1
 
@@ -103,13 +108,20 @@ def test_capture_guards(agent, mandate, automatic, supplied, state):
 def test_capture_requires_paypal_confirmation(agent, mandate, status, completed):
     agent.paypal.capture_authorization.return_value = {"id": "capture", "status": status}
     result = {"authorization_id": "owned-auth", "status": "authorized"}
-    run(agent._capture({"authorization_id": "owned-auth"}, mandate, result))
+    agent.sb.table("mandates").update({"status": "authorized", "paypal_authorization_id": "owned-auth"}).eq("id", mandate["id"]).execute()
+    if status == "PENDING":
+        with pytest.raises(PaymentOutcomeUnknown):
+            run(agent._capture({"authorization_id": "owned-auth"}, mandate, result))
+    else:
+        run(agent._capture({"authorization_id": "owned-auth"}, mandate, result))
     assert (result["status"] == "completed") is completed
-    agent.paypal.capture_authorization.assert_called_once_with("owned-auth")
+    assert agent.paypal.capture_authorization.call_args.args == ("owned-auth",)
+    assert agent.paypal.capture_authorization.call_args.kwargs["request_id"]
 
 
 def test_loop_does_not_complete_authorization_only_payment(agent, mandate):
     mandate["constraints"]["auto_execute"] = False
+    agent.sb.table("mandates").update({"constraints": mandate["constraints"]}).eq("id", mandate["id"]).execute()
     agent.ai.chat_with_tools.side_effect = [
         {"result": {"tool_calls": [{"name": "create_authorized_order", "arguments": purchase()}]}},
         {"result": {"response": "Awaiting manual review"}},
