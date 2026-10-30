@@ -12,6 +12,9 @@ venv/
 .uv-cache/
 .security-venv/
 .test-security-tmp/
+.pytest-temp/
+.pytest-tmp/
+.pytest_cache/
 env/
 
 # Node
@@ -25,6 +28,7 @@ out/
 .env.*.local
 
 # IDE
+.codex/
 .vscode/
 .idea/
 *.swp
