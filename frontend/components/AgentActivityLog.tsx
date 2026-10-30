@@ -21,10 +21,15 @@ const eventIcons: Record<string, React.ReactNode> = {
   search: <Search className="w-4 h-4 text-yellow-400" />,
   evaluate: <Activity className="w-4 h-4 text-orange-400" />,
   authorize: <ShieldCheck className="w-4 h-4 text-purple-400" />,
+  capture: <CheckCircle className="w-4 h-4 text-green-400" />,
   payment: <CreditCard className="w-4 h-4 text-primary-400" />,
+  order: <CreditCard className="w-4 h-4 text-purple-400" />,
+  policy: <ShieldCheck className="w-4 h-4 text-emerald-400" />,
+  void: <XCircle className="w-4 h-4 text-gray-400" />,
   complete: <CheckCircle className="w-4 h-4 text-green-400" />,
   cancel: <XCircle className="w-4 h-4 text-gray-400" />,
   error: <AlertCircle className="w-4 h-4 text-red-400" />,
+  fail: <AlertCircle className="w-4 h-4 text-red-400" />,
   refund: <DollarSign className="w-4 h-4 text-amber-400" />,
 };
 
@@ -32,10 +37,15 @@ const eventColors: Record<string, string> = {
   search: "border-yellow-500/30",
   evaluate: "border-orange-500/30",
   authorize: "border-purple-500/30",
+  capture: "border-green-500/30",
   payment: "border-primary-500/30",
+  order: "border-purple-500/30",
+  policy: "border-emerald-500/30",
+  void: "border-gray-500/30",
   complete: "border-green-500/30",
   cancel: "border-gray-500/30",
   error: "border-red-500/30",
+  fail: "border-red-500/30",
   refund: "border-amber-500/30",
 };
 
@@ -110,7 +120,13 @@ export default function AgentActivityLog({
                   {formatTime(tx.created_at)}
                 </span>
               </div>
-              <p className="text-sm text-gray-400">{tx.details}</p>
+              <p className="text-sm text-gray-400">
+                {typeof tx.details === "string"
+                  ? tx.details
+                  : tx.details
+                  ? JSON.stringify(tx.details)
+                  : ""}
+              </p>
               {tx.amount && (
                 <p className="text-sm text-primary-400 mt-1 font-medium">
                   ${tx.amount.toFixed(2)}

@@ -208,3 +208,232 @@ def test_paypal_verification_request_contains_registered_id(monkeypatch):
         http.post = AsyncMock(return_value=httpx.Response(200, json={"verification_status": "SUCCESS"}, request=httpx.Request("POST", "https://example.com")))
         assert run(service.verify_webhook(EVENT, {"transmission_id": "tx"}))
         assert http.post.call_args.kwargs["json"] == {"transmission_id": "tx", "webhook_id": "registered", "webhook_event": EVENT}
+
+
+# ============================================================================
+# Regression tests for BUG-9 through BUG-15
+# ============================================================================
+
+
+def test_log_transaction_aligns_with_schema_and_normalizes_events():
+    """BUG-9: Verify event type is normalized to check constraint enum and user_id is persisted."""
+    sb = MagicMock()
+    insert_mock = sb.table.return_value.insert
+    with patch("backend.services.supabase_client.get_supabase", return_value=sb):
+        row = db.log_transaction(
+            mandate_id="mandate-9",
+            user_id="user-9",
+            event_type="PAYMENT_AUTHORIZED",
+            paypal_authorization_id="auth-999",
+            amount=75.50,
+            currency="USD",
+            status="authorized",
+            details={"note": "held"},
+        )
+    assert row["event_type"] == "authorized"
+    assert row["user_id"] == "user-9"
+    assert row["paypal_resource_id"] == "auth-999"
+    assert row["paypal_authorization_id"] == "auth-999"
+    assert row["amount"] == 75.50
+    assert row["status"] == "authorized"
+    assert row["details"]["note"] == "held"
+    insert_mock.assert_called_once()
+    saved_payload = insert_mock.call_args.args[0]
+    assert saved_payload["event_type"] == "authorized"
+    assert saved_payload["user_id"] == "user-9"
+    assert saved_payload["paypal_resource_id"] == "auth-999"
+
+
+def test_log_transaction_resolves_user_id_from_mandate_when_missing():
+    """BUG-9: When user_id is omitted, it is queried from the mandates table."""
+    sb = MagicMock()
+    mandates_query = MagicMock()
+    sb.table.side_effect = lambda t: mandates_query if t == "mandates" else MagicMock()
+    mandates_query.select.return_value.eq.return_value.maybe_single.return_value.execute.return_value.data = {
+        "user_id": "resolved-user-123"
+    }
+
+    with patch("backend.services.supabase_client.get_supabase", return_value=sb):
+        row = db.log_transaction(
+            mandate_id="mandate-with-owner",
+            event_type="order_created",
+            paypal_order_id="ord-111",
+        )
+    assert row["user_id"] == "resolved-user-123"
+    assert row["event_type"] == "order_created"
+    assert row["paypal_resource_id"] == "ord-111"
+
+
+def test_cancelled_mandate_aborts_orchestrator_execution_and_voids_authorization():
+    """BUG-10: Orchestrator stops executing tool calls and voids hold if cancelled."""
+    agent_inst = AgentOrchestrator(AsyncMock(), MagicMock(), MagicMock())
+    mandate_data = {"id": "mandate-10", "user_id": "buyer-10", "constraints": {"auto_execute": True}}
+
+    # Mark mandate cancelled in orchestrator
+    agent_inst.cancel_mandate("mandate-10")
+
+    # Order creation must be rejected
+    order_res = run(agent_inst._create_order(purchase(), mandate_data, {}))
+    assert "error" in order_res
+    assert "cancelled" in order_res["error"].lower()
+    agent_inst.paypal.create_authorized_order.assert_not_called()
+
+    # Capture must be aborted and active authorization immediately voided
+    capture_res = run(
+        agent_inst._capture(
+            {"authorization_id": "auth-hold-10"},
+            mandate_data,
+            {"authorization_id": "auth-hold-10", "status": "authorized"},
+        )
+    )
+    assert "error" in capture_res
+    assert "cancelled" in capture_res["error"].lower()
+    agent_inst.paypal.capture_authorization.assert_not_called()
+    agent_inst.paypal.void_authorization.assert_called_once_with("auth-hold-10")
+
+
+def test_create_mandate_merges_parsed_and_partial_explicit_constraints():
+    """BUG-11: Instruction parsing merges with partial explicit constraints without skipping NLP."""
+    sb = MagicMock()
+    orchestrator = MagicMock()
+    cf_ai = AsyncMock()
+    cf_ai.parse_mandate.return_value = {
+        "max_price": 99.99,
+        "currency": "USD",
+        "category": "electronics",
+        "auto_execute": True,
+    }
+
+    # Mandate insert returns created row
+    insert_mock = sb.table.return_value.insert.return_value.execute
+    insert_mock.return_value.data = [{
+        "id": "mandate-11",
+        "user_id": "user-11",
+        "constraints": {"max_price": 99.99, "currency": "USD", "category": "general", "auto_execute": False},
+        "status": "active",
+    }]
+
+    service = MandateService(sb, orchestrator, cf_ai)
+    with patch("backend.services.mandate_service.resolve_payment_token", return_value={"id": "tok-1", "paypal_token_id": "pv-1"}), \
+         patch("backend.services.mandate_service.log_transaction"):
+        result = run(
+            service.create_mandate(
+                user_id="user-11",
+                description="Find a wireless keyboard under 100 dollars",
+                payment_token_id="tok-1",
+                constraints={"category": "general", "auto_execute": False},
+            )
+        )
+
+    # Parsing was called
+    cf_ai.parse_mandate.assert_called_once_with("Find a wireless keyboard under 100 dollars")
+    # Saved constraints merged parsed max_price (99.99) and explicit category ("general")
+    saved_constraints = sb.table.return_value.insert.call_args.args[0]["constraints"]
+    assert saved_constraints["max_price"] == 99.99
+    assert saved_constraints["category"] == "general"
+    assert saved_constraints["auto_execute"] is False
+
+
+def test_mandate_creation_fails_closed_when_budget_cannot_be_parsed():
+    """BUG-12: Creation fails closed with ValueError when spending ceiling is missing/unparseable."""
+    sb = MagicMock()
+    cf_ai = AsyncMock()
+    # Cloudflare AI cannot extract a positive budget
+    cf_ai.parse_mandate.return_value = {"category": "electronics"}
+
+    service = MandateService(sb, MagicMock(), cf_ai)
+    with patch("backend.services.mandate_service.resolve_payment_token", return_value={"id": "tok-1", "paypal_token_id": "pv-1"}), \
+         pytest.raises(ValueError, match="Mandate requires an explicit or parsed positive numeric max_price"):
+        run(
+            service.create_mandate(
+                user_id="user-12",
+                description="Browse some laptops sometime",
+                payment_token_id="tok-1",
+                constraints=None,
+            )
+        )
+    sb.table.return_value.insert.assert_not_called()
+
+
+def test_cloudflare_ai_parse_mandate_fails_closed_on_invalid_json():
+    """BUG-12: CloudflareAI.parse_mandate raises ValueError instead of returning permissive defaults."""
+    from backend.services.cloudflare_ai import CloudflareAI
+
+    cf = CloudflareAI(account_id="acc", api_token="tok")
+    cf.chat = AsyncMock(return_value="Sorry, I cannot understand this instruction.")
+    with pytest.raises(ValueError, match="Failed to parse spending constraints from instruction"):
+        run(cf.parse_mandate("Hello world"))
+
+
+def test_cancel_mandate_fails_and_preserves_authorized_status_when_void_fails():
+    """BUG-14: If PayPal void fails during cancellation, raise RuntimeError and do not mark cancelled."""
+    sb = MagicMock()
+    orchestrator = MagicMock()
+    service = MandateService(sb, orchestrator, AsyncMock())
+
+    service.get_mandate = AsyncMock(return_value={
+        "id": "mandate-14",
+        "user_id": "user-14",
+        "status": "authorized",
+        "paypal_authorization_id": "auth-fail-14",
+    })
+
+    with patch("backend.services.paypal_service.PayPalService.void_authorization", side_effect=RuntimeError("PayPal connection timed out")), \
+         patch("backend.services.mandate_service.update_mandate_status") as update_mock, \
+         patch("backend.services.mandate_service.log_transaction") as log_mock:
+        with pytest.raises(RuntimeError, match="Failed to void PayPal authorization auth-fail-14"):
+            run(service.cancel_mandate("mandate-14", "user-14"))
+
+        # Status must not be updated to cancelled
+        update_mock.assert_not_called()
+        # Failure transaction must be logged
+        assert any(call.kwargs.get("event_type") == "failed" for call in log_mock.call_args_list)
+
+
+def test_cancel_mandate_route_reports_502_on_void_error():
+    """BUG-14: HTTP endpoint returns 502 Bad Gateway when cancellation void fails."""
+    from backend.routes import mandates as mandates_route
+
+    app = FastAPI()
+    app.include_router(mandates_route.router)
+    app.dependency_overrides[mandates_route.get_current_user] = lambda: {"id": "user-14", "email": "user@example.com"}
+
+    mock_service = MagicMock()
+    mock_service.cancel_mandate = AsyncMock(side_effect=RuntimeError("PayPal void rejected: 400 Bad Request"))
+    app.dependency_overrides[mandates_route.get_mandate_service] = lambda: mock_service
+
+    client = TestClient(app)
+    response = client.post("/api/mandates/mandate-14/cancel")
+    assert response.status_code == 502
+    assert "PayPal void rejected" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("mandate_cat, product_cat, expected_decision", [
+    ("product", "electronics", "APPROVED"),
+    ("electronics", "electronics", "APPROVED"),
+    ("flight", "flights", "APPROVED"),
+    ("flights", "flight", "APPROVED"),
+    ("food", "food", "APPROVED"),
+    ("electronics", "food", "REJECTED"),
+])
+def test_category_normalization_aligns_ui_and_policy(mandate_cat, product_cat, expected_decision):
+    """BUG-15: UI category 'product' and variants correctly normalize to policy categories."""
+    agent_inst = AgentOrchestrator(AsyncMock(), MagicMock(), MagicMock())
+    test_mandate = {
+        "id": "mandate-15",
+        "user_id": "user-15",
+        "constraints": {
+            "max_price": 200.0,
+            "currency": "USD",
+            "category": mandate_cat,
+        },
+    }
+    test_product = {
+        "product_name": "Test Item",
+        "price": 99.0,
+        "currency": "USD",
+        "category": product_cat,
+    }
+    result = agent_inst._check_policy(test_product, test_mandate)
+    assert result["decision"] == expected_decision
+

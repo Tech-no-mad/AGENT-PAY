@@ -93,32 +93,138 @@ def update_mandate_status(
 # Transaction helpers
 # ---------------------------------------------------------------------------
 
+VALID_TRANSACTION_EVENTS = {
+    "mandate_created",
+    "search_started",
+    "deal_found",
+    "policy_approved",
+    "policy_rejected",
+    "order_created",
+    "authorized",
+    "captured",
+    "voided",
+    "failed",
+    "refunded",
+}
+
+EVENT_TYPE_MAPPING = {
+    "mandate_created": "mandate_created",
+    "created": "mandate_created",
+    "mandate_cancelled": "voided",
+    "cancelled": "voided",
+    "mandate_completed": "captured",
+    "completed": "captured",
+    "mandate_failed": "failed",
+    "search_products": "search_started",
+    "search_started": "search_started",
+    "searching": "search_started",
+    "deal_found": "deal_found",
+    "policy_approved": "policy_approved",
+    "policy_rejected": "policy_rejected",
+    "order_created": "order_created",
+    "payment_authorized": "authorized",
+    "authorized": "authorized",
+    "payment_captured": "captured",
+    "captured": "captured",
+    "authorization_voided": "voided",
+    "voided": "voided",
+    "capture_denied": "failed",
+    "capture_declined": "failed",
+    "payment_refunded": "refunded",
+    "refunded": "refunded",
+    "failed": "failed",
+    "error": "failed",
+}
+
+
+def normalize_transaction_event(event_type: str) -> str:
+    """Normalize any arbitrary event string to the transactions table check constraint."""
+    lower = (event_type or "").strip().lower()
+    if lower in VALID_TRANSACTION_EVENTS:
+        return lower
+    if lower in EVENT_TYPE_MAPPING:
+        return EVENT_TYPE_MAPPING[lower]
+    # Fuzzy match on substrings
+    if "search" in lower:
+        return "search_started"
+    if "deal" in lower or "found" in lower:
+        return "deal_found"
+    if "approve" in lower:
+        return "policy_approved"
+    if "reject" in lower:
+        return "policy_rejected"
+    if "order" in lower:
+        return "order_created"
+    if "auth" in lower:
+        return "authorized"
+    if "captur" in lower or "complet" in lower:
+        return "captured"
+    if "void" in lower or "cancel" in lower:
+        return "voided"
+    if "refund" in lower:
+        return "refunded"
+    return "failed"
+
+
 def log_transaction(
     mandate_id: str,
     event_type: str,
     *,
+    user_id: Optional[str] = None,
+    paypal_resource_id: Optional[str] = None,
     paypal_order_id: Optional[str] = None,
     paypal_authorization_id: Optional[str] = None,
     paypal_capture_id: Optional[str] = None,
     amount: Optional[float] = None,
-    currency: Optional[str] = None,
+    currency: Optional[str] = "USD",
     status: Optional[str] = None,
     details: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
-    """Insert a row into the transactions table."""
+    """Insert a row into the transactions table strictly conforming to database schema."""
     sb = get_supabase()
+
+    # Resolve user_id if not explicitly provided
+    resolved_user_id = user_id
+    if not resolved_user_id:
+        try:
+            m_res = sb.table("mandates").select("user_id").eq("id", mandate_id).maybe_single().execute()
+            if m_res and m_res.data:
+                resolved_user_id = m_res.data.get("user_id")
+        except Exception as lookup_err:
+            logger.debug("Could not resolve user_id for mandate %s: %s", mandate_id, lookup_err)
+
+    normalized_event = normalize_transaction_event(event_type)
+    resource_id = (
+        paypal_resource_id
+        or paypal_capture_id
+        or paypal_authorization_id
+        or paypal_order_id
+    )
+
+    details_payload = dict(details or {})
+    if paypal_order_id:
+        details_payload["paypal_order_id"] = paypal_order_id
+    if paypal_authorization_id:
+        details_payload["paypal_authorization_id"] = paypal_authorization_id
+    if paypal_capture_id:
+        details_payload["paypal_capture_id"] = paypal_capture_id
+    if status:
+        details_payload["status"] = status
+    if event_type and event_type.lower() != normalized_event:
+        details_payload["source_event_type"] = event_type
+
     row: dict[str, Any] = {
         "mandate_id": mandate_id,
-        "event_type": event_type,
-        "paypal_order_id": paypal_order_id,
-        "paypal_authorization_id": paypal_authorization_id,
-        "paypal_capture_id": paypal_capture_id,
+        "event_type": normalized_event,
+        "paypal_resource_id": resource_id,
         "amount": amount,
-        "currency": currency,
-        "status": status,
-        "details": details,
+        "currency": currency or "USD",
+        "details": details_payload,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
+    if resolved_user_id:
+        row["user_id"] = resolved_user_id
+
     try:
         result = sb.table("transactions").insert(row).execute()
         return result.data[0] if result.data else None

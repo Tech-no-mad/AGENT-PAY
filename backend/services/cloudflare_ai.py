@@ -153,7 +153,10 @@ class CloudflareAI:
             else:
                 parsed = response_text
 
-            # Ensure defaults
+            if not isinstance(parsed, dict):
+                raise ValueError("Parsed constraints from AI is not a valid JSON object")
+
+            # Ensure defaults for optional fields
             defaults = {
                 "max_price": None,
                 "currency": "USD",
@@ -169,12 +172,5 @@ class CloudflareAI:
             return parsed
 
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            logger.warning("Failed to parse mandate via AI: %s — using defaults", exc)
-            return {
-                "max_price": None,
-                "currency": "USD",
-                "category": None,
-                "deadline": None,
-                "auto_execute": True,
-                "additional_rules": description,
-            }
+            logger.warning("Failed to parse mandate via AI: %s — failing closed", exc)
+            raise ValueError(f"Failed to parse spending constraints from instruction: {exc}") from exc
