@@ -33,7 +33,7 @@ class MandateCreate(BaseModel):
     """Payload for creating a new mandate."""
 
     description: str = Field(..., min_length=1, description="Natural-language spending instruction")
-    payment_token_id: str = Field(..., description="Vaulted PayPal payment token ID")
+    payment_token_id: str = Field(..., description="Database UUID of an active payment token owned by the user")
     constraints: Optional[MandateConstraints] = Field(None, description="Optional explicit constraints")
 
 

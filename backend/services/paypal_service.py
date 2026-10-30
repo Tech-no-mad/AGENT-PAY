@@ -23,7 +23,8 @@ from paypalserversdk.models.order_request import OrderRequest
 from paypalserversdk.models.payment_source import PaymentSource
 from paypalserversdk.models.token import Token
 from paypalserversdk.models.purchase_unit_request import PurchaseUnitRequest
-from paypalserversdk.paypalserversdk_client import PaypalserversdkClient
+from paypalserversdk.paypal_serversdk_client import PaypalServersdkClient
+from paypalserversdk.configuration import Environment
 
 from backend.config import settings
 
@@ -36,7 +37,7 @@ class PayPalService:
     SANDBOX_BASE = "https://api-m.sandbox.paypal.com"
 
     def __init__(self) -> None:
-        self.client = PaypalserversdkClient(
+        self.client = PaypalServersdkClient(
             client_credentials_auth_credentials=ClientCredentialsAuthCredentials(
                 o_auth_client_id=settings.PAYPAL_CLIENT_ID,
                 o_auth_client_secret=settings.PAYPAL_CLIENT_SECRET,
@@ -51,7 +52,7 @@ class PayPalService:
                     log_body=True,
                 ),
             ),
-            environment="sandbox",
+            environment=Environment.SANDBOX,
         )
         self._orders_controller = self.client.orders
         self._payments_controller = self.client.payments
@@ -83,6 +84,19 @@ class PayPalService:
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+
+    async def verify_webhook(self, event: dict[str, Any], headers: dict[str, str]) -> bool:
+        """Ask PayPal to verify the full event against our registered webhook."""
+        if not settings.PAYPAL_WEBHOOK_ID:
+            raise RuntimeError("PAYPAL_WEBHOOK_ID must be configured")
+        async with httpx.AsyncClient(timeout=20) as http:
+            response = await http.post(
+                f"{self.SANDBOX_BASE}/v1/notifications/verify-webhook-signature",
+                headers=await self._auth_headers(),
+                json={**headers, "webhook_id": settings.PAYPAL_WEBHOOK_ID, "webhook_event": event},
+            )
+            response.raise_for_status()
+            return response.json().get("verification_status") == "SUCCESS"
 
     # ------------------------------------------------------------------
     # Vault v3 — setup tokens & payment tokens (httpx)

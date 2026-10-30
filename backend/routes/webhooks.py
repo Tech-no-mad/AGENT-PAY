@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Header, Request, status
 
 from backend.config import settings
+from backend.services.paypal_service import PayPalService
 from backend.services.supabase_client import get_supabase, log_transaction, update_mandate_status
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,27 @@ async def paypal_webhook(
     except Exception as exc:
         logger.error("Failed to parse webhook JSON: %s", exc)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+    signature_headers = {
+        "auth_algo": paypal_auth_algo,
+        "transmission_id": paypal_transmission_id,
+        "cert_url": paypal_cert_url,
+        "transmission_sig": paypal_transmission_sig,
+        "transmission_time": paypal_transmission_time,
+    }
+    if not all(signature_headers.values()):
+        raise HTTPException(status_code=400, detail="Missing PayPal signature headers")
+    if not settings.PAYPAL_WEBHOOK_ID:
+        raise HTTPException(status_code=503, detail="Webhook verification is not configured")
+    try:
+        verified = await PayPalService().verify_webhook(body, signature_headers)
+    except Exception as exc:
+        logger.error("PayPal webhook verification unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="Webhook verification unavailable") from exc
+    if not verified:
+        raise HTTPException(status_code=401, detail="Invalid PayPal webhook signature")
 
     event_type = body.get("event_type", "UNKNOWN")
     resource = body.get("resource", {})

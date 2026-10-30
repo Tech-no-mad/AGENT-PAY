@@ -15,6 +15,7 @@ class Settings:
     # PayPal Sandbox Credentials
     PAYPAL_CLIENT_ID: str = os.getenv("PAYPAL_CLIENT_ID", "")
     PAYPAL_CLIENT_SECRET: str = os.getenv("PAYPAL_CLIENT_SECRET", "")
+    PAYPAL_WEBHOOK_ID: str = os.getenv("PAYPAL_WEBHOOK_ID", "")
 
     # Supabase
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
