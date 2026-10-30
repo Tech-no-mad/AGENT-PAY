@@ -38,7 +38,8 @@ This change does not add a separate human approval/capture endpoint.
 `test_remaining_review_findings.py` covers BUG-9, BUG-10, BUG-11, BUG-12, BUG-14,
 and BUG-15: the audit schema, cancellation races, partial constraint merging,
 failed extraction, retryable voids, and category matching. The suite currently
-contains 95 tests in total, including the original 34 security regressions.
+contains 123 tests in total, including the original 34 security regressions,
+the scenarios merged from main, and the main-integration regression tests.
 
 Extraction must return a complete, typed object. Invalid JSON/shape/values or a
 failed provider response raises an error before mandate insertion or worker
@@ -65,6 +66,10 @@ The migration adds `cancel_requested`, `payment_operation`,
 claims a payment only when cancellation has not been requested and no operation
 already owns the mandate. Completion/checkpoint writes match the claim UUID.
 Ordinary status writes cannot change terminal, cancel-requested, or claimed rows.
+
+The process-wide task registry also lets a request-scoped service stop an AI
+await started by another request in the same process. This is an optimization;
+the durable stop flag and conditional payment claims enforce cross-process safety.
 
 Cancellation sets the durable stop flag before touching PayPal. A worker
 rechecks state after each AI await and before tool dispatch. If authorization
@@ -105,3 +110,19 @@ UI renders structured JSON safely and reads `paypal_resource_id`.
 Live PayPal verification/payments, Supabase RLS, PostgreSQL deployment, and browser
 interaction still require separate integration validation. The local frontend
 build/type check uses placeholder public Supabase configuration, not live keys.
+
+## Integrating the main-branch fixes
+
+The resolution of main at `2f6272d` retains its configurable Llama 3.3 model,
+explicit model override, development anonymous-key fallback, legacy category
+aliases, activity metadata rendering, canonical audit labels, and dashboard copy.
+The anonymous fallback remains subject to RLS and does not grant privileged
+payment/audit access; production background operations require the service key.
+
+`test_main_integration.py` checks those configuration contracts, exact failure
+event normalization, the explicit `paypal_resource_id` argument, legacy aliases,
+rejection of wildcard categories, and cancellation between separate request
+service instances. Main's new review scenarios remain covered, using persisted
+schema-backed rows rather than unconfigured MagicMock return values. The invalid
+AI JSON test patches `chat_with_tools`, the method actually used, so it cannot
+accidentally make a provider request.

@@ -37,13 +37,15 @@ def resolve_payment_token(sb: Any, token_id: str, user_id: str) -> dict[str, Any
 
 
 def get_supabase() -> Client:
-    """Return (and lazily initialise) a Supabase client using the service-role key."""
+    """Use the service key, or main's anonymous-key development fallback (RLS applies)."""
     global _supabase_client
     if _supabase_client is None:
-        if not settings.SUPABASE_URL or not settings.SUPABASE_SERVICE_KEY:
-            raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set")
-        _supabase_client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_KEY)
-        logger.info("Supabase client initialised (service-role)")
+        key = settings.SUPABASE_SERVICE_KEY or settings.SUPABASE_ANON_KEY
+        if not settings.SUPABASE_URL or not key:
+            raise RuntimeError("SUPABASE_URL and at least SUPABASE_ANON_KEY must be set")
+        _supabase_client = create_client(settings.SUPABASE_URL, key)
+        role_label = "service-role" if settings.SUPABASE_SERVICE_KEY else "anon"
+        logger.info("Supabase client initialised (%s)", role_label)
     return _supabase_client
 
 
@@ -110,9 +112,21 @@ _EVENT_NAMES = {
     "AUTHORIZATION_VOIDED": "voided", "PAYMENT_REFUNDED": "refunded",
     "ORDER_FAILED": "failed", "CAPTURE_FAILED": "failed", "CAPTURE_DENIED": "failed",
     "MANDATE_FAILED": "failed", "MANDATE_COMPLETED": "captured", "MANDATE_CANCELLED": "voided",
+    "CREATED": "mandate_created", "CANCELLED": "voided", "COMPLETED": "captured",
+    "SEARCH_PRODUCTS": "search_started", "SEARCHING": "search_started",
+    "CAPTURE_DECLINED": "failed", "ERROR": "failed",
 }
 _SCHEMA_EVENTS = {"mandate_created", "search_started", "deal_found", "policy_approved", "policy_rejected",
                   "order_created", "authorized", "captured", "voided", "failed", "refunded"}
+
+
+def normalize_transaction_event(event_type: str) -> str:
+    """Normalize known aliases exactly; failure events must never imply success."""
+    event_type = (event_type or "").strip()
+    normalized = _EVENT_NAMES.get(event_type.upper(), event_type.lower())
+    if normalized not in _SCHEMA_EVENTS:
+        raise ValueError(f"Unsupported audit event: {event_type}")
+    return normalized
 
 def log_transaction(
     mandate_id: str,
@@ -121,6 +135,7 @@ def log_transaction(
     paypal_order_id: Optional[str] = None,
     paypal_authorization_id: Optional[str] = None,
     paypal_capture_id: Optional[str] = None,
+    paypal_resource_id: Optional[str] = None,
     amount: Optional[float] = None,
     currency: Optional[str] = None,
     status: Optional[str] = None,
@@ -141,7 +156,7 @@ def log_transaction(
                 raise ValueError("Policy audit requires an explicit decision")
             normalized = "policy_approved" if status == "APPROVED" else "policy_rejected"
         else:
-            normalized = _EVENT_NAMES.get(event_type, event_type.lower())
+            normalized = normalize_transaction_event(event_type)
         if normalized not in _SCHEMA_EVENTS:
             raise ValueError(f"Unsupported audit event: {event_type}")
         metadata = dict(details or {})
@@ -156,7 +171,7 @@ def log_transaction(
                 metadata[key] = value
         row = {
             "mandate_id": mandate_id, "user_id": user_id, "event_type": normalized,
-            "paypal_resource_id": paypal_capture_id or paypal_authorization_id or paypal_order_id,
+            "paypal_resource_id": paypal_resource_id or paypal_capture_id or paypal_authorization_id or paypal_order_id,
             "amount": amount, "currency": currency or "USD", "details": metadata,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }

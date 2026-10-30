@@ -12,10 +12,14 @@ from backend.models.schemas import MandateConstraints
 
 from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.cloudflare_ai import CloudflareAI
-from backend.services.mandate_lifecycle import MandateLifecycle
-from backend.services.supabase_client import log_transaction, update_mandate_status, resolve_payment_token
+from backend.services.mandate_lifecycle import CancellationFailed, CancellationPending, MandateLifecycle
+from backend.services.supabase_client import AuditLogError, log_transaction, update_mandate_status, resolve_payment_token
 
 logger = logging.getLogger(__name__)
+
+# Request-scoped services must see tasks started by other requests in this process.
+# The database stop flag/claims remain authoritative across different processes.
+_ACTIVE_TASKS: dict[str, asyncio.Task] = {}
 
 
 class MandateService:
@@ -31,6 +35,7 @@ class MandateService:
         self.orchestrator = agent_orchestrator
         self.ai = cloudflare_ai
         self.lifecycle = MandateLifecycle(self.sb, self.orchestrator.paypal)
+        self._active_tasks = _ACTIVE_TASKS
 
     # ------------------------------------------------------------------
     # CRUD
@@ -80,7 +85,7 @@ class MandateService:
         )
 
         # Fire-and-forget: kick off agent execution in the background
-        asyncio.create_task(self._run_agent(mandate))
+        self._active_tasks[mandate_id] = asyncio.create_task(self._run_agent(mandate))
 
         return mandate
 
@@ -88,6 +93,8 @@ class MandateService:
         """Background task that runs the agent orchestrator."""
         try:
             await self.orchestrator.execute_mandate(mandate)
+        except asyncio.CancelledError:
+            logger.info("Background execution for mandate %s stopped", mandate["id"])
         except Exception as exc:
             logger.exception("Background agent execution failed for mandate %s", mandate.get("id"))
             update_mandate_status(
@@ -96,6 +103,9 @@ class MandateService:
                 {"agent_reasoning": f"Background execution error: {exc}"},
                 supabase_client=self.sb,
             )
+        finally:
+            if self._active_tasks.get(mandate["id"]) is asyncio.current_task():
+                self._active_tasks.pop(mandate["id"], None)
 
     async def get_mandates(self, user_id: str) -> list[dict[str, Any]]:
         """List all mandates for a user, ordered by most recent first."""
@@ -128,7 +138,18 @@ class MandateService:
         if not mandate:
             return None
 
-        return self.lifecycle.cancel(mandate_id, user_id)
+        try:
+            cancelled = self.lifecycle.cancel(mandate_id, user_id)
+        except (CancellationPending, CancellationFailed, AuditLogError):
+            self._stop_local_task(mandate_id)
+            raise
+        self._stop_local_task(mandate_id)
+        return cancelled
+
+    def _stop_local_task(self, mandate_id: str) -> None:
+        task = self._active_tasks.get(mandate_id)
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
 
     # ------------------------------------------------------------------
     # Status transitions

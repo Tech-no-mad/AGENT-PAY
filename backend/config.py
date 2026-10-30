@@ -25,6 +25,9 @@ class Settings:
     # Cloudflare Workers AI
     CLOUDFLARE_ACCOUNT_ID: str = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
     CLOUDFLARE_API_TOKEN: str = os.getenv("CLOUDFLARE_API_TOKEN", "")
+    CLOUDFLARE_MODEL: str = os.getenv(
+        "CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    )
 
     # Application URLs
     BACKEND_URL: str = os.getenv("BACKEND_URL", "http://localhost:8000")

@@ -123,6 +123,9 @@ async def cancel_mandate(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (CancellationFailed, AuditLogError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        logger.error("Failed to cancel mandate %s: %s", mandate_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     if not cancelled:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

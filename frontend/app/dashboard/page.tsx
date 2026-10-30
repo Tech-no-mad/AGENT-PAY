@@ -57,7 +57,7 @@ export default function DashboardPage() {
             Agent Dashboard
             <span className="inline-flex items-center gap-1 text-xs font-normal px-2.5 py-0.5 rounded-full bg-primary-500/10 text-primary-400 border border-primary-500/20">
               <Sparkles className="w-3 h-3" />
-              Llama 3.1 70B + PayPal SDK
+              Llama 3.3 70B + PayPal SDK
             </span>
           </h1>
           <p className="text-gray-400 text-sm mt-1">
