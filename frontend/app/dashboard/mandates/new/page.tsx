@@ -42,7 +42,7 @@ export default function NewMandatePage() {
         setTokens(methods);
         if (methods.length > 0) {
           // Select first active token by default
-          setSelectedTokenId(methods[0].paypal_token_id || methods[0].id);
+          setSelectedTokenId(methods[0].id);
         }
       } catch (err: any) {
         console.error("Failed to load payment methods:", err);
@@ -187,7 +187,7 @@ export default function NewMandatePage() {
                 className="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:border-primary-500"
               >
                 {tokens.map((t) => (
-                  <option key={t.id} value={t.paypal_token_id || t.id}>
+                  <option key={t.id} value={t.id}>
                     {t.display_name} ({t.payment_source_type.toUpperCase()})
                   </option>
                 ))}

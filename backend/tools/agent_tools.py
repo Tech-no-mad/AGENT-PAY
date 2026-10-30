@@ -88,6 +88,10 @@ AGENT_TOOLS: list[dict] = [
                         "type": "number",
                         "description": "Total amount to authorize",
                     },
+                    "category": {
+                        "type": "string",
+                        "description": "Category of the actual purchase for mandatory policy validation",
+                    },
                     "currency": {
                         "type": "string",
                         "description": "ISO 4217 currency code (default USD)",
@@ -101,7 +105,7 @@ AGENT_TOOLS: list[dict] = [
                         "description": "Name of the product being purchased",
                     },
                 },
-                "required": ["amount", "currency", "description"],
+                "required": ["amount", "currency", "description", "category", "product_name"],
             },
         },
     },

@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from backend.models.schemas import AuthResponse, LoginRequest, SignUpRequest
-from backend.services.supabase_client import get_supabase, get_user_profile
+from backend.services.supabase_client import get_auth_client, get_user_profile
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ async def get_current_user(
         )
 
     token = credentials.credentials
-    sb = get_supabase()
+    sb = get_auth_client()
 
     try:
         user_res = sb.auth.get_user(token)
@@ -62,7 +62,7 @@ async def get_current_user(
 @router.post("/signup", response_model=AuthResponse)
 async def signup(payload: SignUpRequest) -> AuthResponse:
     """Register a new user via Supabase Auth."""
-    sb = get_supabase()
+    sb = get_auth_client()
     try:
         res = sb.auth.sign_up({
             "email": payload.email,
@@ -102,7 +102,7 @@ async def signup(payload: SignUpRequest) -> AuthResponse:
 @router.post("/login", response_model=AuthResponse)
 async def login(payload: LoginRequest) -> AuthResponse:
     """Log in an existing user via Supabase Auth."""
-    sb = get_supabase()
+    sb = get_auth_client()
     try:
         res = sb.auth.sign_in_with_password({
             "email": payload.email,

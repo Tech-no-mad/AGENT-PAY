@@ -19,6 +19,22 @@ logger = logging.getLogger(__name__)
 _supabase_client: Optional[Client] = None
 
 
+def get_auth_client() -> Client:
+    """Use a fresh, anonymous-key client per authentication request."""
+    if not settings.SUPABASE_URL or not settings.SUPABASE_ANON_KEY:
+        raise RuntimeError("SUPABASE_URL and SUPABASE_ANON_KEY must be set")
+    return create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
+
+
+def resolve_payment_token(sb: Any, token_id: str, user_id: str) -> dict[str, Any]:
+    """Resolve only an active database token belonging to the mandate owner."""
+    token = (sb.table("payment_tokens").select("*").eq("id", token_id)
+             .eq("user_id", user_id).eq("is_active", True).maybe_single().execute()).data
+    if not token or not token.get("paypal_token_id"):
+        raise ValueError("An active payment token owned by the user is required")
+    return token
+
+
 def get_supabase() -> Client:
     """Return (and lazily initialise) a Supabase client using the service-role key."""
     global _supabase_client

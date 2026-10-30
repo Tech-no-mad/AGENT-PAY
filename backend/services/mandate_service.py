@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.cloudflare_ai import CloudflareAI
-from backend.services.supabase_client import get_supabase, log_transaction, update_mandate_status
+from backend.services.supabase_client import get_supabase, log_transaction, update_mandate_status, resolve_payment_token
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,8 @@ class MandateService:
         Create a new mandate, parse constraints via AI if not provided,
         and kick off the agent execution in the background.
         """
+        resolve_payment_token(self.sb, payment_token_id, user_id)
+
         # Parse constraints from natural language if not explicitly provided
         if not constraints:
             constraints = await self.ai.parse_mandate(description)
@@ -51,7 +53,7 @@ class MandateService:
             "user_id": user_id,
             "description": description,
             "payment_token_id": payment_token_id,
-            "status": "pending",
+            "status": "active",
             "constraints": constraints,
         }
 
@@ -122,7 +124,7 @@ class MandateService:
             return mandate
 
         # Void authorization if one exists
-        authorization_id = mandate.get("authorization_id")
+        authorization_id = mandate.get("paypal_authorization_id")
         if authorization_id:
             try:
                 from backend.services.paypal_service import PayPalService

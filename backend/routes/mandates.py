@@ -63,6 +63,8 @@ async def create_mandate(
             constraints=constraints_dict,
         )
         return mandate
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("Error creating mandate: %s", exc)
         raise HTTPException(

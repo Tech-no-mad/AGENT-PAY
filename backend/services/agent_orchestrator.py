@@ -14,12 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import random
+import math
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from backend.services.cloudflare_ai import CloudflareAI
 from backend.services.paypal_service import PayPalService
-from backend.services.supabase_client import log_transaction, update_mandate_status
+from backend.services.supabase_client import get_supabase, resolve_payment_token, log_transaction, update_mandate_status
 from backend.tools.agent_tools import AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -62,10 +63,11 @@ class AgentOrchestrator:
         self,
         cloudflare_ai: CloudflareAI,
         paypal_service: PayPalService,
-        supabase_client: Any = None,  # kept for symmetry; we use module helpers
+        supabase_client: Any = None,
     ) -> None:
         self.ai = cloudflare_ai
         self.paypal = paypal_service
+        self.sb = supabase_client
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -120,8 +122,6 @@ class AgentOrchestrator:
                 if not tool_calls:
                     # No more tool calls — agent is done
                     result["agent_reasoning"] = response_text or result["agent_reasoning"]
-                    if result["order_id"] or result["capture_id"]:
-                        result["status"] = "completed"
                     break
 
                 # Add assistant message with tool calls to history
@@ -163,15 +163,11 @@ class AgentOrchestrator:
                 "agent_reasoning": result.get("agent_reasoning"),
             }
             if result.get("order_id"):
-                extra_fields["order_id"] = result["order_id"]
+                extra_fields["paypal_order_id"] = result["order_id"]
             if result.get("authorization_id"):
-                extra_fields["authorization_id"] = result["authorization_id"]
+                extra_fields["paypal_authorization_id"] = result["authorization_id"]
             if result.get("amount"):
-                extra_fields["amount"] = result["amount"]
-            if result.get("currency"):
-                extra_fields["currency"] = result["currency"]
-            if result.get("product_name"):
-                extra_fields["product_name"] = result["product_name"]
+                extra_fields["executed_amount"] = result["amount"]
 
             update_mandate_status(mandate_id, result["status"], extra_fields)
             logger.info("Agent finished mandate %s — status=%s", mandate_id, result["status"])
@@ -274,8 +270,15 @@ class AgentOrchestrator:
         product_name = args.get("product_name", "")
         category = args.get("category", "")
 
+        if isinstance(price, bool) or not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0:
+            return {"decision": "REJECTED", "reason": "Amount must be a finite positive number"}
+        if not isinstance(currency, str) or not currency:
+            return {"decision": "REJECTED", "reason": "Currency is required"}
+
         # Check max_price
         max_price = constraints.get("max_price")
+        if isinstance(max_price, bool) or not isinstance(max_price, (int, float)) or not math.isfinite(max_price) or max_price <= 0:
+            return {"decision": "REJECTED", "reason": "A finite positive mandate budget is required"}
         if max_price is not None and price > max_price:
             return {
                 "decision": "REJECTED",
@@ -292,6 +295,8 @@ class AgentOrchestrator:
 
         # Check category if specified
         required_category = constraints.get("category")
+        if required_category and not category:
+            return {"decision": "REJECTED", "reason": "Purchase category is required"}
         if required_category and category:
             if required_category.lower() not in category.lower() and category.lower() not in required_category.lower():
                 return {
@@ -310,10 +315,12 @@ class AgentOrchestrator:
                         "reason": "Mandate deadline has passed",
                     }
             except (ValueError, TypeError):
-                pass  # Skip malformed deadlines
+                return {"decision": "REJECTED", "reason": "Invalid mandate deadline"}
 
         # Check additional_rules — basic keyword blocking
         additional_rules = constraints.get("additional_rules", "")
+        if isinstance(additional_rules, list):
+            additional_rules = " ".join(additional_rules)
         if additional_rules:
             # Simple check: if rules say "no" + category, reject
             lower_rules = additional_rules.lower()
@@ -341,6 +348,14 @@ class AgentOrchestrator:
         product_name = args.get("product_name", "")
         payment_token_id = mandate.get("payment_token_id", "")
         mandate_id = mandate["id"]
+
+        if result.get("order_id"):
+            return {"error": "An order already exists for this execution"}
+        policy = self._check_policy({**args, "price": amount}, mandate)
+        if policy["decision"] != "APPROVED":
+            return {"error": "Purchase rejected by mandate policy", "reason": policy["reason"]}
+        token = resolve_payment_token(self.sb or get_supabase(), payment_token_id, mandate["user_id"])
+        payment_token_id = token["paypal_token_id"]
 
         try:
             # Create order with AUTHORIZE intent
@@ -379,13 +394,12 @@ class AgentOrchestrator:
             result["amount"] = amount
             result["currency"] = currency
             result["product_name"] = product_name
+            result["status"] = "authorized" if authorization_id else "failed"
 
-            update_mandate_status(mandate_id, "authorized", {
-                "order_id": order_id,
-                "authorization_id": authorization_id,
-                "amount": amount,
-                "currency": currency,
-                "product_name": product_name,
+            update_mandate_status(mandate_id, result["status"], {
+                "paypal_order_id": order_id,
+                "paypal_authorization_id": authorization_id,
+                "executed_amount": amount,
             })
 
             log_transaction(
@@ -421,7 +435,13 @@ class AgentOrchestrator:
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
         """Capture an authorized payment."""
-        authorization_id = args.get("authorization_id") or result.get("authorization_id")
+        if (mandate.get("constraints") or {}).get("auto_execute") is not True:
+            return {"error": "Manual approval required; agent capture is disabled"}
+        authorization_id = result.get("authorization_id")
+        if args.get("authorization_id") and args["authorization_id"] != authorization_id:
+            return {"error": "Authorization does not belong to this execution"}
+        if result.get("status") != "authorized":
+            return {"error": "Execution is not awaiting capture"}
         if not authorization_id:
             return {"error": "No authorization_id available to capture"}
 
@@ -430,6 +450,9 @@ class AgentOrchestrator:
             capture_id = (
                 capture_result.id if hasattr(capture_result, "id") else capture_result.get("id", "")
             )
+            capture_status = capture_result.status if hasattr(capture_result, "status") else capture_result.get("status")
+            if capture_status != "COMPLETED" or not capture_id:
+                return {"error": "PayPal has not confirmed a completed capture"}
 
             result["capture_id"] = capture_id
             result["status"] = "completed"
@@ -463,7 +486,9 @@ class AgentOrchestrator:
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
         """Void an authorization."""
-        authorization_id = args.get("authorization_id") or result.get("authorization_id")
+        authorization_id = result.get("authorization_id")
+        if args.get("authorization_id") and args["authorization_id"] != authorization_id:
+            return {"error": "Authorization does not belong to this execution"}
         if not authorization_id:
             return {"error": "No authorization_id available to void"}
 
