@@ -12,6 +12,8 @@ interface MandateCardProps {
 
 export default function MandateCard({ mandate }: MandateCardProps) {
   const router = useRouter();
+  const maxAmount = typeof mandate.constraints?.max_price === "number"
+    ? mandate.constraints.max_price : undefined;
 
   const formatDate = (dateStr: string) => {
     return new Date(dateStr).toLocaleDateString("en-US", {
@@ -48,14 +50,14 @@ export default function MandateCard({ mandate }: MandateCardProps) {
           <span>{formatDate(mandate.created_at)}</span>
         </div>
 
-        {(mandate.max_amount || mandate.executed_amount) && (
+        {(maxAmount || mandate.executed_amount) && (
           <div className="flex items-center gap-1.5">
             <DollarSign className="w-3.5 h-3.5" />
             <span>
               {mandate.executed_amount
                 ? `$${mandate.executed_amount.toFixed(2)}`
-                : mandate.max_amount
-                ? `Max $${mandate.max_amount.toFixed(2)}`
+                : maxAmount
+                ? `Max $${maxAmount.toFixed(2)}`
                 : ""}
             </span>
           </div>

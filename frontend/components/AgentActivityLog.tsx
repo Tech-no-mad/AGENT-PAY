@@ -51,6 +51,11 @@ const eventColors: Record<string, string> = {
 
 function getEventKey(eventType: string): string {
   const lower = eventType.toLowerCase();
+  const canonical: Record<string, string> = {
+    policy_approved: "evaluate", policy_rejected: "error", captured: "complete",
+    voided: "cancel", failed: "error", order_created: "payment",
+  };
+  if (canonical[lower]) return canonical[lower];
   for (const key of Object.keys(eventIcons)) {
     if (lower.includes(key)) return key;
   }

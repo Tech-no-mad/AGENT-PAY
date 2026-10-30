@@ -89,6 +89,12 @@ cp .env.example .env
 
 ### 3. Setup PayPal Sandbox
 
+Apply `supabase/migrations/002_payment_cancellation_coordination.sql` after the
+initial schema and before starting the updated backend. Drain old background
+workers before deployment; do not mix workers that ignore cancellation with the
+new coordinator. See `backend/tests/README.md` for the cancellation/reconciliation
+runbook. Ship the repository's `shared/` directory with the backend and frontend.
+
 1. Go to [PayPal Developer Dashboard](https://developer.paypal.com/)
 2. Create a sandbox app → copy Client ID and Secret to `.env`
 3. Create sandbox Business + Personal test accounts
@@ -103,9 +109,8 @@ cp .env.example .env
 ### 5. Start Backend
 
 ```bash
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+pip install -r backend/requirements.txt
+python -m uvicorn backend.main:app --reload --port 8000
 ```
 
 ### 6. Start Frontend

@@ -4,10 +4,12 @@ AgentPay Pydantic Models / Schemas.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+
+from backend.services.categories import normalize_category
 
 
 # ---------------------------------------------------------------------------
@@ -17,12 +19,49 @@ from pydantic import BaseModel, Field
 class MandateConstraints(BaseModel):
     """Structured spending constraints extracted from natural-language mandates."""
 
-    max_price: Optional[float] = Field(None, description="Maximum allowed price")
-    currency: str = Field("USD", description="ISO 4217 currency code")
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
+
+    max_price: Optional[float] = Field(None, gt=0, description="Maximum allowed price")
+    currency: str = Field("USD", pattern=r"^[A-Z]{3}$", description="ISO 4217 currency code")
     category: Optional[str] = Field(None, description="Product/service category")
     deadline: Optional[str] = Field(None, description="ISO-8601 deadline for the purchase")
-    auto_execute: bool = Field(True, description="Automatically capture after authorization")
+    auto_execute: StrictBool = Field(True, description="Automatically capture after authorization")
     additional_rules: Optional[str] = Field(None, description="Free-text rules the agent must respect")
+
+    @field_validator("currency", mode="before")
+    @classmethod
+    def currency_code(cls, value: Any) -> Any:
+        return value.upper() if isinstance(value, str) else value
+
+    @field_validator("category")
+    @classmethod
+    def category_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            value = normalize_category(value)
+            if not value:
+                raise ValueError("Category cannot be empty")
+        return value
+
+    @field_validator("deadline")
+    @classmethod
+    def aware_deadline(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError("Deadline must include a timezone")
+        return parsed.astimezone(timezone.utc).isoformat()
+
+
+class ExtractedMandateConstraints(MandateConstraints):
+    """Extraction must provide the full typed shape, even for absent limits."""
+
+    max_price: Optional[float] = Field(..., gt=0)
+    currency: str = Field(..., pattern=r"^[A-Z]{3}$")
+    category: Optional[str] = Field(...)
+    deadline: Optional[str] = Field(...)
+    auto_execute: StrictBool = Field(...)
+    additional_rules: Optional[str] = Field(...)
 
 
 # ---------------------------------------------------------------------------
@@ -89,15 +128,11 @@ class TransactionResponse(BaseModel):
 
     id: str
     mandate_id: str
-    user_id: Optional[str] = None
+    user_id: str
     event_type: str
     paypal_resource_id: Optional[str] = None
-    paypal_order_id: Optional[str] = None
-    paypal_authorization_id: Optional[str] = None
-    paypal_capture_id: Optional[str] = None
     amount: Optional[float] = None
     currency: Optional[str] = None
-    status: Optional[str] = None
     details: Optional[dict[str, Any]] = None
     created_at: Optional[str] = None
 

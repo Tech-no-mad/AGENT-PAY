@@ -1,6 +1,6 @@
 """
 Cloudflare Workers AI integration — chat completions with function calling
-using the @cf/meta/llama-3.1-70b-instruct model.
+using the configured Cloudflare Workers AI model.
 """
 
 from __future__ import annotations
@@ -10,6 +10,8 @@ import logging
 from typing import Any, Optional
 
 import httpx
+from backend.models.schemas import ExtractedMandateConstraints
+from backend.services.categories import CATEGORIES
 
 from backend.config import settings
 
@@ -18,6 +20,10 @@ logger = logging.getLogger(__name__)
 # Maximum retries for transient failures
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = [1.0, 2.0, 4.0]
+
+
+class ConstraintParseError(ValueError):
+    """Extraction failed; no mandate may be started with invented defaults."""
 
 
 class CloudflareAI:
@@ -129,6 +135,9 @@ class CloudflareAI:
             '  "deadline": string (ISO 8601) or null,\n'
             '  "auto_execute": boolean (default true),\n'
             '  "additional_rules": string or null\n'
+            f"Use canonical broad categories where applicable: {', '.join(CATEGORIES)}. "
+            "Never invent a budget or deadline. Use null when none is specified. "
+            "Use auto_execute=false if approval is requested. Include all six fields."
         )
 
         messages = [
@@ -138,11 +147,10 @@ class CloudflareAI:
 
         try:
             result = await self.chat_with_tools(messages, tools=[])
-            # Cloudflare returns { "result": { "response": "..." } }
-            response_text = (
-                result.get("result", {}).get("response", "")
-                or result.get("result", "")
-            )
+            if not isinstance(result, dict) or result.get("success") is False:
+                raise ValueError("Extraction provider returned an unsuccessful response")
+            response = result.get("result")
+            response_text = response.get("response") if isinstance(response, dict) else response
 
             if isinstance(response_text, str):
                 # Strip markdown code fences if present
@@ -153,24 +161,7 @@ class CloudflareAI:
             else:
                 parsed = response_text
 
-            if not isinstance(parsed, dict):
-                raise ValueError("Parsed constraints from AI is not a valid JSON object")
-
-            # Ensure defaults for optional fields
-            defaults = {
-                "max_price": None,
-                "currency": "USD",
-                "category": None,
-                "deadline": None,
-                "auto_execute": True,
-                "additional_rules": None,
-            }
-            for k, v in defaults.items():
-                parsed.setdefault(k, v)
-
-            logger.info("Parsed mandate constraints: %s", parsed)
-            return parsed
-
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            logger.warning("Failed to parse mandate via AI: %s — failing closed", exc)
-            raise ValueError(f"Failed to parse spending constraints from instruction: {exc}") from exc
+            return ExtractedMandateConstraints.model_validate(parsed).model_dump()
+        except (ValueError, KeyError, TypeError, httpx.HTTPError, RuntimeError) as exc:
+            logger.warning("Mandate extraction rejected: %s", type(exc).__name__)
+            raise ConstraintParseError("Unable to safely parse spending constraints; review the instructions and retry") from exc

@@ -19,49 +19,18 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from backend.services.cloudflare_ai import CloudflareAI
+from backend.services.categories import category_allowed, normalize_category
+from backend.services.mandate_lifecycle import (
+    MandateLifecycle, ExecutionStopped, CancellationPending, CancellationFailed, PaymentOutcomeUnknown, field,
+)
 from backend.services.paypal_service import PayPalService
-from backend.services.supabase_client import get_supabase, resolve_payment_token, log_transaction, update_mandate_status
+from backend.services.supabase_client import AuditLogError, get_supabase, resolve_payment_token, log_transaction, update_mandate_status
 from backend.tools.agent_tools import AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
 
 # Maximum agentic loop iterations
 MAX_TURNS = 10
-
-CATEGORY_ALIASES: dict[str, str] = {
-    "product": "electronics",
-    "products": "electronics",
-    "physical goods": "electronics",
-    "electronics": "electronics",
-    "electronic": "electronics",
-    "tech": "electronics",
-    "gadget": "electronics",
-    "gadgets": "electronics",
-    "flight": "flights",
-    "flights": "flights",
-    "travel": "flights",
-    "plane": "flights",
-    "airline": "flights",
-    "food": "food",
-    "foods": "food",
-    "grocery": "food",
-    "groceries": "food",
-    "meal": "food",
-    "dining": "food",
-    "general": "general",
-    "goods": "general",
-    "service": "general",
-    "services": "general",
-}
-
-
-def normalize_category(cat: Optional[str]) -> str:
-    """Normalize a category name to the policy engine's standard domain."""
-    if not cat:
-        return "general"
-    cleaned = str(cat).strip().lower()
-    return CATEGORY_ALIASES.get(cleaned, cleaned)
-
 
 # ---------------------------------------------------------------------------
 # System prompt for the AI agent
@@ -103,25 +72,19 @@ class AgentOrchestrator:
         self.ai = cloudflare_ai
         self.paypal = paypal_service
         self.sb = supabase_client
-        self._cancelled_mandates: set[str] = set()
 
-    def cancel_mandate(self, mandate_id: str) -> None:
-        """Register that a mandate has been cancelled."""
-        self._cancelled_mandates.add(mandate_id)
+    @property
+    def lifecycle(self) -> MandateLifecycle:
+        return MandateLifecycle(self.sb if self.sb is not None else get_supabase(), self.paypal)
 
-    def _is_cancelled(self, mandate_id: str) -> bool:
-        """Check whether a mandate has been marked cancelled in memory or database."""
-        if mandate_id in self._cancelled_mandates:
-            return True
-        if self.sb:
-            try:
-                res = self.sb.table("mandates").select("status").eq("id", mandate_id).maybe_single().execute()
-                if res and res.data and res.data.get("status") == "cancelled":
-                    self._cancelled_mandates.add(mandate_id)
-                    return True
-            except Exception:
-                pass
-        return False
+    def _refresh_running(self, mandate: dict[str, Any]) -> None:
+        current = self.lifecycle.current(mandate["id"])
+        if current.get("cancel_requested"):
+            current = self.lifecycle.cancel(current["id"], current["user_id"])
+            raise ExecutionStopped(current)
+        if current["status"] in ("completed", "cancelled", "failed"):
+            raise ExecutionStopped(current)
+        mandate.update(current)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -135,24 +98,6 @@ class AgentOrchestrator:
         """
         mandate_id = mandate_dict["id"]
         logger.info("Agent starting execution for mandate %s", mandate_id)
-
-        if self._is_cancelled(mandate_id):
-            logger.info("Mandate %s was cancelled before execution started", mandate_id)
-            return {
-                "mandate_id": mandate_id,
-                "status": "cancelled",
-                "agent_reasoning": "Mandate cancelled before execution started",
-                "order_id": None,
-                "authorization_id": None,
-                "capture_id": None,
-                "amount": None,
-                "currency": None,
-                "product_name": None,
-                "error": None,
-            }
-
-        # Update status → searching
-        update_mandate_status(mandate_id, "searching")
 
         constraints = mandate_dict.get("constraints") or {}
         user_message = self._build_user_message(mandate_dict)
@@ -176,27 +121,13 @@ class AgentOrchestrator:
         }
 
         try:
+            self._refresh_running(mandate_dict)
+            update_mandate_status(mandate_id, "searching", supabase_client=self.sb)
             for turn in range(MAX_TURNS):
-                if self._is_cancelled(mandate_id):
-                    logger.info("Mandate %s was cancelled during turn %d; aborting", mandate_id, turn + 1)
-                    if result.get("authorization_id") and result.get("status") == "authorized":
-                        try:
-                            self.paypal.void_authorization(result["authorization_id"])
-                            log_transaction(
-                                mandate_id=mandate_id,
-                                user_id=mandate_dict.get("user_id"),
-                                event_type="voided",
-                                paypal_resource_id=result["authorization_id"],
-                                details={"reason": "cancelled_during_turn"},
-                            )
-                        except Exception as void_err:
-                            logger.error("Failed to void authorization during cancellation: %s", void_err)
-                    result["status"] = "cancelled"
-                    break
-
                 logger.info("Agent turn %d/%d for mandate %s", turn + 1, MAX_TURNS, mandate_id)
 
                 response = await self.ai.chat_with_tools(messages, AGENT_TOOLS)
+                self._refresh_running(mandate_dict)
 
                 # Parse the Cloudflare response
                 ai_result = response.get("result", {})
@@ -219,11 +150,6 @@ class AgentOrchestrator:
 
                 # Execute each tool call
                 for tc in tool_calls:
-                    if self._is_cancelled(mandate_id):
-                        logger.info("Mandate %s was cancelled before tool dispatch; aborting", mandate_id)
-                        result["status"] = "cancelled"
-                        break
-
                     fn_name = tc.get("name", "")
                     fn_args_raw = tc.get("arguments", {})
                     tc_id = tc.get("id", fn_name)
@@ -249,15 +175,6 @@ class AgentOrchestrator:
                         "content": json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result,
                     })
 
-                if self._is_cancelled(mandate_id):
-                    result["status"] = "cancelled"
-                    break
-
-            if self._is_cancelled(mandate_id) or result.get("status") == "cancelled":
-                logger.info("Mandate %s ended in cancelled state; preserving without overwrite", mandate_id)
-                result["status"] = "cancelled"
-                return result
-
             # Final status update
             extra_fields: dict[str, Any] = {
                 "agent_reasoning": result.get("agent_reasoning"),
@@ -269,39 +186,27 @@ class AgentOrchestrator:
             if result.get("amount"):
                 extra_fields["executed_amount"] = result["amount"]
 
-            if not self._is_cancelled(mandate_id):
-                update_mandate_status(mandate_id, result["status"], extra_fields)
-            else:
-                result["status"] = "cancelled"
+            self._refresh_running(mandate_dict)
+            updated = update_mandate_status(mandate_id, result["status"], extra_fields, supabase_client=self.sb)
+            if not updated:
+                result["status"] = self.lifecycle.current(mandate_id)["status"]
             logger.info("Agent finished mandate %s — status=%s", mandate_id, result["status"])
 
-        except asyncio.CancelledError:
-            logger.info("Execution task for mandate %s cancelled via asyncio", mandate_id)
-            self.cancel_mandate(mandate_id)
-            if result.get("authorization_id") and result.get("status") == "authorized":
-                try:
-                    self.paypal.void_authorization(result["authorization_id"])
-                    log_transaction(
-                        mandate_id=mandate_id,
-                        user_id=mandate_dict.get("user_id"),
-                        event_type="voided",
-                        paypal_resource_id=result["authorization_id"],
-                        details={"reason": "asyncio_task_cancelled"},
-                    )
-                except Exception as void_err:
-                    logger.error("Failed to void authorization on task cancellation: %s", void_err)
-            result["status"] = "cancelled"
-            raise
+        except ExecutionStopped as exc:
+            result["status"] = exc.mandate["status"]
+            result["agent_reasoning"] = exc.mandate.get("agent_reasoning") or str(exc)
+        except (CancellationPending, CancellationFailed, PaymentOutcomeUnknown) as exc:
+            result["status"] = self.lifecycle.current(mandate_id)["status"]
+            result["error"] = str(exc)
         except Exception as exc:
             logger.exception("Agent execution failed for mandate %s", mandate_id)
-            result["status"] = "failed"
             result["error"] = str(exc)
-            if not self._is_cancelled(mandate_id):
-                update_mandate_status(mandate_id, "failed", {"agent_reasoning": f"Error: {exc}"})
+            current = self.lifecycle.current(mandate_id)
+            if current.get("payment_operation_id") or current.get("cancel_requested") or current["status"] in ("authorized", "completed", "cancelled"):
+                result["status"] = current["status"]
             else:
-                result["status"] = "cancelled"
-        finally:
-            self._cancelled_mandates.discard(mandate_id)
+                update_mandate_status(mandate_id, "failed", {"agent_reasoning": f"Error: {exc}"}, supabase_client=self.sb)
+                result["status"] = self.lifecycle.current(mandate_id)["status"]
 
         return result
 
@@ -317,9 +222,6 @@ class AgentOrchestrator:
         result: dict[str, Any],
     ) -> Any:
         """Dispatch a tool call to the appropriate handler."""
-        if self._is_cancelled(mandate.get("id", "")):
-            return {"error": "Mandate execution was cancelled"}
-
         handlers = {
             "search_products": self._search_products,
             "check_mandate_policy": self._check_policy_wrapper,
@@ -333,7 +235,10 @@ class AgentOrchestrator:
             return {"error": f"Unknown tool: {name}"}
 
         try:
+            self._refresh_running(mandate)
             return await handler(args, mandate, result)
+        except (ExecutionStopped, CancellationPending, CancellationFailed, PaymentOutcomeUnknown, AuditLogError):
+            raise
         except Exception as exc:
             logger.error("Tool %s failed: %s", name, exc)
             return {"error": str(exc)}
@@ -346,10 +251,7 @@ class AgentOrchestrator:
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
         """Mock product search — returns realistic fake data for the demo."""
-        if self._is_cancelled(mandate.get("id", "")):
-            return {"error": "Mandate execution was cancelled"}
-
-        update_mandate_status(mandate["id"], "searching")
+        update_mandate_status(mandate["id"], "searching", supabase_client=self.sb)
 
         query = args.get("query", "")
         category = normalize_category(args.get("category", "general"))
@@ -361,10 +263,10 @@ class AgentOrchestrator:
 
         log_transaction(
             mandate_id=mandate["id"],
-            user_id=mandate.get("user_id"),
-            event_type="search_started",
+            event_type="PRODUCT_SEARCH",
             status="completed",
             details={"query": query, "results_count": len(products)},
+            user_id=mandate["user_id"], supabase_client=self.sb,
         )
 
         return {"products": products, "total_results": len(products)}
@@ -373,20 +275,16 @@ class AgentOrchestrator:
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
         """Check mandate policy and return approval/rejection."""
-        if self._is_cancelled(mandate.get("id", "")):
-            return {"decision": "REJECTED", "reason": "Mandate execution was cancelled"}
-
-        update_mandate_status(mandate["id"], "evaluating")
+        update_mandate_status(mandate["id"], "evaluating", supabase_client=self.sb)
         policy_result = self._check_policy(args, mandate)
 
-        evt = "policy_approved" if policy_result.get("decision") == "APPROVED" else "policy_rejected"
         log_transaction(
             mandate_id=mandate["id"],
-            user_id=mandate.get("user_id"),
-            event_type=evt,
+            event_type="POLICY_CHECK",
             amount=args.get("price"),
             currency=args.get("currency", "USD"),
-            status=policy_result.get("decision"),
+            status=policy_result["decision"],
+            user_id=mandate["user_id"], supabase_client=self.sb,
             details={
                 "product_name": args.get("product_name"),
                 "justification": args.get("justification"),
@@ -435,14 +333,11 @@ class AgentOrchestrator:
         if required_category and not category:
             return {"decision": "REJECTED", "reason": "Purchase category is required"}
         if required_category and category:
-            norm_req = normalize_category(required_category)
-            norm_actual = normalize_category(category)
-            if norm_req != "general" and norm_actual != "general" and norm_req != norm_actual:
-                if norm_req not in norm_actual and norm_actual not in norm_req:
-                    return {
-                        "decision": "REJECTED",
-                        "reason": f"Category '{category}' does not match required '{required_category}'",
-                    }
+            if not category_allowed(required_category, category):
+                return {
+                    "decision": "REJECTED",
+                    "reason": f"Category '{category}' does not match required '{required_category}'",
+                }
 
         # Check deadline
         deadline = constraints.get("deadline")
@@ -478,190 +373,126 @@ class AgentOrchestrator:
             "reason": f"Purchase of '{product_name}' at ${price:.2f} {currency} meets all mandate constraints",
         }
 
+    @staticmethod
+    def _authorization_id(order: Any) -> Any:
+        for unit in field(order, "purchase_units", []) or []:
+            for authorization in field(field(unit, "payments", {}), "authorizations", []) or []:
+                return field(authorization, "id")
+        return None
+
+    def _check_cancel_after_claim(self, claim: dict[str, Any]) -> None:
+        if self.lifecycle.current(claim["id"]).get("cancel_requested"):
+            self.lifecycle.finish(claim)
+            cancelled = self.lifecycle.cancel(claim["id"], claim["user_id"])
+            raise ExecutionStopped(cancelled)
+
     async def _create_order(
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
-        """Create and authorize a PayPal order."""
-        if self._is_cancelled(mandate.get("id", "")):
-            return {"error": "Mandate execution was cancelled"}
-
-        amount = args.get("amount", 0)
-        currency = args.get("currency", "USD")
-        description = args.get("description", mandate.get("description", ""))
-        product_name = args.get("product_name", "")
-        payment_token_id = mandate.get("payment_token_id", "")
-        mandate_id = mandate["id"]
-
+        """Validate, claim and authorize; cancellation cannot race a later capture."""
         if result.get("order_id"):
             return {"error": "An order already exists for this execution"}
+        amount = args.get("amount", 0)
         policy = self._check_policy({**args, "price": amount}, mandate)
         if policy["decision"] != "APPROVED":
             return {"error": "Purchase rejected by mandate policy", "reason": policy["reason"]}
-        token = resolve_payment_token(self.sb or get_supabase(), payment_token_id, mandate["user_id"])
-        payment_token_id = token["paypal_token_id"]
-
+        token = resolve_payment_token(self.lifecycle.sb, mandate["payment_token_id"], mandate["user_id"])
+        claim = self.lifecycle.claim(mandate["id"], "authorize")
+        # Constraints may have changed since the AI request was sent.
+        policy = self._check_policy({**args, "price": amount}, claim)
+        if policy["decision"] != "APPROVED":
+            self.lifecycle.finish(claim)
+            return {"error": "Purchase rejected by current mandate policy", "reason": policy["reason"]}
+        self._check_cancel_after_claim(claim)
+        currency = args.get("currency", "USD")
+        description = args.get("description", mandate.get("description", ""))
         try:
-            # Create order with AUTHORIZE intent
             order = self.paypal.create_authorized_order(
-                amount=amount,
-                currency=currency,
-                description=description,
-                payment_token_id=payment_token_id,
-                mandate_id=mandate_id,
+                amount=amount, currency=currency, description=description,
+                payment_token_id=token["paypal_token_id"], mandate_id=mandate["id"],
+                request_id=claim["payment_operation_id"],
             )
-
-            order_id = order.id if hasattr(order, "id") else order.get("id", "")
-            order_status = order.status if hasattr(order, "status") else order.get("status", "")
-
-            # Extract authorization ID if the order was auto-authorized
-            authorization_id = None
-            if hasattr(order, "purchase_units"):
-                for pu in order.purchase_units:
-                    if hasattr(pu, "payments") and pu.payments and hasattr(pu.payments, "authorizations"):
-                        for auth in pu.payments.authorizations:
-                            authorization_id = auth.id if hasattr(auth, "id") else auth.get("id")
-                            break
-
-            # If not auto-authorized, explicitly authorize
-            if not authorization_id and order_status == "CREATED":
-                auth_result = self.paypal.authorize_order(order_id)
-                if hasattr(auth_result, "purchase_units"):
-                    for pu in auth_result.purchase_units:
-                        if hasattr(pu, "payments") and pu.payments and hasattr(pu.payments, "authorizations"):
-                            for auth in pu.payments.authorizations:
-                                authorization_id = auth.id if hasattr(auth, "id") else auth.get("id")
-                                break
-
+            order_id = field(order, "id")
+            if not order_id:
+                raise ValueError("PayPal returned no order ID")
             result["order_id"] = order_id
-            result["authorization_id"] = authorization_id
-            result["amount"] = amount
-            result["currency"] = currency
-            result["product_name"] = product_name
-            result["status"] = "authorized" if authorization_id else "failed"
-
-            update_mandate_status(mandate_id, result["status"], {
-                "paypal_order_id": order_id,
-                "paypal_authorization_id": authorization_id,
-                "executed_amount": amount,
-            })
-
-            log_transaction(
-                mandate_id=mandate_id,
-                user_id=mandate.get("user_id"),
-                event_type="authorized",
-                paypal_order_id=order_id,
-                paypal_authorization_id=authorization_id,
-                amount=amount,
-                currency=currency,
-                status="authorized",
-                details={"product_name": product_name, "description": description},
-            )
-
-            return {
-                "order_id": order_id,
-                "authorization_id": authorization_id,
-                "status": "AUTHORIZED",
-                "amount": amount,
-                "currency": currency,
-            }
-
+            self.lifecycle.checkpoint(claim, paypal_order_id=order_id)
+            authorization_id = self._authorization_id(order)
+            if not authorization_id and field(order, "status") in ("CREATED", "APPROVED"):
+                # An order without an authorization holds no funds yet.
+                self._check_cancel_after_claim(claim)
+                from uuid import NAMESPACE_URL, uuid5
+                authorized = self.paypal.authorize_order(order_id, request_id=str(
+                    uuid5(NAMESPACE_URL, claim["payment_operation_id"] + ":authorize")))
+                authorization_id = self._authorization_id(authorized)
+            if not authorization_id:
+                raise ValueError("PayPal authorization outcome is unknown")
+        except (ExecutionStopped, CancellationPending, CancellationFailed):
+            raise
         except Exception as exc:
-            logger.error("Order creation failed: %s", exc)
-            log_transaction(
-                mandate_id=mandate_id,
-                user_id=mandate.get("user_id"),
-                event_type="failed",
-                status="failed",
-                details={"error": str(exc)},
-            )
-            return {"error": f"Failed to create order: {exc}"}
+            self.lifecycle.checkpoint(claim, agent_reasoning=f"Authorization requires reconciliation: {exc}")
+            log_transaction(mandate["id"], "ORDER_FAILED", user_id=mandate["user_id"], supabase_client=self.sb,
+                            paypal_order_id=result.get("order_id"), status="unknown", details={"error": str(exc)})
+            self.lifecycle.uncertain(claim, "Authorization outcome is unknown; reconcile before retrying")
+        result.update(authorization_id=authorization_id, amount=amount, currency=currency,
+                      product_name=args.get("product_name", ""), status="authorized")
+        self.lifecycle.finish(claim, status="authorized", paypal_order_id=order_id,
+                              paypal_authorization_id=authorization_id, executed_amount=amount)
+        log_transaction(mandate["id"], "ORDER_AUTHORIZED", user_id=mandate["user_id"], supabase_client=self.sb,
+                        paypal_order_id=order_id, paypal_authorization_id=authorization_id, amount=amount,
+                        currency=currency, status="authorized", details={"product_name": result["product_name"]})
+        self._refresh_running(mandate)
+        return {"order_id": order_id, "authorization_id": authorization_id, "status": "AUTHORIZED",
+                "amount": amount, "currency": currency}
 
     async def _capture(
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
-        """Capture an authorized payment."""
-        if self._is_cancelled(mandate.get("id", "")):
-            return {"error": "Mandate execution was cancelled"}
-
+        """Capture only this execution's authorization under an exclusive claim."""
         if (mandate.get("constraints") or {}).get("auto_execute") is not True:
             return {"error": "Manual approval required; agent capture is disabled"}
         authorization_id = result.get("authorization_id")
         if args.get("authorization_id") and args["authorization_id"] != authorization_id:
             return {"error": "Authorization does not belong to this execution"}
-        if result.get("status") != "authorized":
+        if result.get("status") != "authorized" or not authorization_id:
             return {"error": "Execution is not awaiting capture"}
-        if not authorization_id:
-            return {"error": "No authorization_id available to capture"}
-
+        claim = self.lifecycle.claim(mandate["id"], "capture")
+        if ((claim.get("constraints") or {}).get("auto_execute") is not True
+                or claim.get("paypal_authorization_id") != authorization_id):
+            self.lifecycle.finish(claim)
+            return {"error": "Current mandate does not permit capturing this authorization"}
+        self._check_cancel_after_claim(claim)
         try:
-            capture_result = self.paypal.capture_authorization(authorization_id)
-            capture_id = (
-                capture_result.id if hasattr(capture_result, "id") else capture_result.get("id", "")
-            )
-            capture_status = capture_result.status if hasattr(capture_result, "status") else capture_result.get("status")
-            if capture_status != "COMPLETED" or not capture_id:
-                return {"error": "PayPal has not confirmed a completed capture"}
-
-            result["capture_id"] = capture_id
-            result["status"] = "completed"
-
-            update_mandate_status(mandate["id"], "completed")
-
-            log_transaction(
-                mandate_id=mandate["id"],
-                user_id=mandate.get("user_id"),
-                event_type="captured",
-                paypal_authorization_id=authorization_id,
-                paypal_capture_id=capture_id,
-                amount=result.get("amount"),
-                currency=result.get("currency"),
-                status="completed",
-            )
-
-            return {"capture_id": capture_id, "status": "CAPTURED"}
-
+            captured = self.paypal.capture_authorization(authorization_id, request_id=claim["payment_operation_id"])
         except Exception as exc:
-            logger.error("Capture failed: %s", exc)
-            log_transaction(
-                mandate_id=mandate["id"],
-                user_id=mandate.get("user_id"),
-                event_type="failed",
-                paypal_authorization_id=authorization_id,
-                status="failed",
-                details={"error": str(exc)},
-            )
-            return {"error": f"Capture failed: {exc}"}
+            log_transaction(mandate["id"], "CAPTURE_FAILED", user_id=mandate["user_id"], supabase_client=self.sb,
+                            paypal_authorization_id=authorization_id, status="unknown", details={"error": str(exc)})
+            self.lifecycle.uncertain(claim, "Capture outcome is unknown; reconcile before retrying")
+        capture_id, capture_status = field(captured, "id"), field(captured, "status")
+        if capture_status in ("DECLINED", "DENIED", "FAILED"):
+            self.lifecycle.finish(claim)
+            return {"error": "PayPal declined the capture"}
+        if capture_status != "COMPLETED" or not capture_id:
+            self.lifecycle.uncertain(claim, "PayPal capture is pending or unconfirmed; reconciliation required")
+        result.update(capture_id=capture_id, status="completed")
+        self.lifecycle.finish(claim, status="completed")
+        log_transaction(mandate["id"], "PAYMENT_CAPTURED", user_id=mandate["user_id"], supabase_client=self.sb,
+                        paypal_authorization_id=authorization_id, paypal_capture_id=capture_id,
+                        amount=result.get("amount"), currency=result.get("currency"), status="completed")
+        return {"capture_id": capture_id, "status": "CAPTURED"}
 
     async def _void(
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
-        """Void an authorization."""
         authorization_id = result.get("authorization_id")
         if args.get("authorization_id") and args["authorization_id"] != authorization_id:
             return {"error": "Authorization does not belong to this execution"}
-        if not authorization_id:
-            return {"error": "No authorization_id available to void"}
-
-        try:
-            self.paypal.void_authorization(authorization_id)
-            result["status"] = "cancelled"
-
-            update_mandate_status(mandate["id"], "cancelled")
-
-            log_transaction(
-                mandate_id=mandate["id"],
-                user_id=mandate.get("user_id"),
-                event_type="voided",
-                paypal_resource_id=authorization_id,
-                paypal_authorization_id=authorization_id,
-                status="voided",
-            )
-
-            return {"status": "VOIDED", "authorization_id": authorization_id}
-
-        except Exception as exc:
-            logger.error("Void failed: %s", exc)
-            return {"error": f"Void failed: {exc}"}
+        current = self.lifecycle.current(mandate["id"])
+        if not authorization_id or current.get("paypal_authorization_id") != authorization_id:
+            return {"error": "No authorization belonging to this execution is available to void"}
+        cancelled = self.lifecycle.cancel(mandate["id"], mandate["user_id"])
+        result["status"] = cancelled["status"]
+        return {"status": "VOIDED", "authorization_id": authorization_id}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -731,7 +562,7 @@ def _generate_mock_products(
     }
 
     # Pick the best matching template
-    category_lower = normalize_category(category)
+    category_lower = normalize_category(category) if category else "general"
     template_key = "general"
     for key in templates:
         if key in category_lower or key in query.lower():

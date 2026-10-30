@@ -12,6 +12,7 @@ import {
   HelpCircle,
 } from "lucide-react";
 import { createMandate, getVaultTokens, VaultToken } from "@/lib/api";
+import purchaseCategories from "@shared/purchase_categories.json";
 
 const PROMPT_SUGGESTIONS = [
   "Find noise-cancelling wireless headphones under $150 with 4+ star rating and order them.",
@@ -29,7 +30,7 @@ export default function NewMandatePage() {
   const [selectedTokenId, setSelectedTokenId] = useState("");
   const [maxPrice, setMaxPrice] = useState<string>("");
   const [autoExecute, setAutoExecute] = useState(true);
-  const [category, setCategory] = useState("electronics");
+  const [category, setCategory] = useState("physical_goods");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -226,10 +227,9 @@ export default function NewMandatePage() {
                   onChange={(e) => setCategory(e.target.value)}
                   className="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary-500"
                 >
-                  <option value="electronics">Electronics & Tech</option>
-                  <option value="flights">Flight / Travel</option>
-                  <option value="food">Food & Groceries</option>
-                  <option value="general">General Goods & Services</option>
+                  {Object.entries(purchaseCategories).map(([value, definition]) => (
+                    <option key={value} value={value}>{definition.label}</option>
+                  ))}
                 </select>
               </div>
 
