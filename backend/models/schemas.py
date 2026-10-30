@@ -89,7 +89,9 @@ class TransactionResponse(BaseModel):
 
     id: str
     mandate_id: str
+    user_id: Optional[str] = None
     event_type: str
+    paypal_resource_id: Optional[str] = None
     paypal_order_id: Optional[str] = None
     paypal_authorization_id: Optional[str] = None
     paypal_capture_id: Optional[str] = None

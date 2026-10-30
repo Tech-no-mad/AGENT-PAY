@@ -32,6 +32,12 @@ remain authorized. Completion requires a PayPal capture with status COMPLETED.
 This change does not add a separate human approval/capture endpoint.
 
 Live PayPal verification, real payments, Supabase RLS, and browser interaction
-require separate integration validation. Other findings from the original review
-(audit insert schema, cancellation coordination/void failure handling, natural
-language extraction/merging, and category vocabulary) remain follow-up work.
+require separate integration validation. Findings from BUG-9 through BUG-15 are
+now resolved and covered by regression tests:
+- BUG-9: Audit transaction inserts align with the Supabase `transactions` schema (`user_id` NOT NULL, valid enum check constraints, `paypal_resource_id` mapping).
+- BUG-10: Mandate cancellation halts background agent loop execution and immediately voids active PayPal authorizations.
+- BUG-11: Merges parsed instructions with partial explicit constraints without skipping natural language processing.
+- BUG-12: Mandate creation fails closed (HTTP 400 / `ValueError`) when spending ceilings cannot be parsed or are missing.
+- BUG-13: Preserves authorization-only and cancellation states upon completion of agent execution loop.
+- BUG-14: Reports authorization-void failures as HTTP 502 and keeps mandate authorized instead of confirming cancellation.
+- BUG-15: Normalizes UI category options and aliases to the policy engine category vocabulary (`electronics`, `flights`, `food`, `general`).

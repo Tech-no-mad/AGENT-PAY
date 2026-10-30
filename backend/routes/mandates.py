@@ -115,13 +115,20 @@ async def cancel_mandate(
     Cancel an active mandate. If funds are currently authorized on PayPal,
     the authorization is automatically voided.
     """
-    cancelled = await service.cancel_mandate(mandate_id, current_user["id"])
-    if not cancelled:
+    try:
+        cancelled = await service.cancel_mandate(mandate_id, current_user["id"])
+        if not cancelled:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Mandate not found or already completed/cancelled",
+            )
+        return cancelled
+    except RuntimeError as exc:
+        logger.error("Failed to cancel mandate %s due to void error: %s", mandate_id, exc)
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Mandate not found or already completed/cancelled",
-        )
-    return cancelled
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get("/transactions/all", response_model=list[dict[str, Any]])

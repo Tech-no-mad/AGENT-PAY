@@ -29,7 +29,7 @@ export default function NewMandatePage() {
   const [selectedTokenId, setSelectedTokenId] = useState("");
   const [maxPrice, setMaxPrice] = useState<string>("");
   const [autoExecute, setAutoExecute] = useState(true);
-  const [category, setCategory] = useState("product");
+  const [category, setCategory] = useState("electronics");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -226,9 +226,10 @@ export default function NewMandatePage() {
                   onChange={(e) => setCategory(e.target.value)}
                   className="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary-500"
                 >
-                  <option value="product">Physical Goods / Electronics</option>
-                  <option value="flight">Flight / Travel</option>
-                  <option value="service">Digital Service / Subscription</option>
+                  <option value="electronics">Electronics & Tech</option>
+                  <option value="flights">Flight / Travel</option>
+                  <option value="food">Food & Groceries</option>
+                  <option value="general">General Goods & Services</option>
                 </select>
               </div>
 

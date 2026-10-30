@@ -28,6 +28,41 @@ logger = logging.getLogger(__name__)
 # Maximum agentic loop iterations
 MAX_TURNS = 10
 
+CATEGORY_ALIASES: dict[str, str] = {
+    "product": "electronics",
+    "products": "electronics",
+    "physical goods": "electronics",
+    "electronics": "electronics",
+    "electronic": "electronics",
+    "tech": "electronics",
+    "gadget": "electronics",
+    "gadgets": "electronics",
+    "flight": "flights",
+    "flights": "flights",
+    "travel": "flights",
+    "plane": "flights",
+    "airline": "flights",
+    "food": "food",
+    "foods": "food",
+    "grocery": "food",
+    "groceries": "food",
+    "meal": "food",
+    "dining": "food",
+    "general": "general",
+    "goods": "general",
+    "service": "general",
+    "services": "general",
+}
+
+
+def normalize_category(cat: Optional[str]) -> str:
+    """Normalize a category name to the policy engine's standard domain."""
+    if not cat:
+        return "general"
+    cleaned = str(cat).strip().lower()
+    return CATEGORY_ALIASES.get(cleaned, cleaned)
+
+
 # ---------------------------------------------------------------------------
 # System prompt for the AI agent
 # ---------------------------------------------------------------------------
@@ -68,6 +103,25 @@ class AgentOrchestrator:
         self.ai = cloudflare_ai
         self.paypal = paypal_service
         self.sb = supabase_client
+        self._cancelled_mandates: set[str] = set()
+
+    def cancel_mandate(self, mandate_id: str) -> None:
+        """Register that a mandate has been cancelled."""
+        self._cancelled_mandates.add(mandate_id)
+
+    def _is_cancelled(self, mandate_id: str) -> bool:
+        """Check whether a mandate has been marked cancelled in memory or database."""
+        if mandate_id in self._cancelled_mandates:
+            return True
+        if self.sb:
+            try:
+                res = self.sb.table("mandates").select("status").eq("id", mandate_id).maybe_single().execute()
+                if res and res.data and res.data.get("status") == "cancelled":
+                    self._cancelled_mandates.add(mandate_id)
+                    return True
+            except Exception:
+                pass
+        return False
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -81,6 +135,21 @@ class AgentOrchestrator:
         """
         mandate_id = mandate_dict["id"]
         logger.info("Agent starting execution for mandate %s", mandate_id)
+
+        if self._is_cancelled(mandate_id):
+            logger.info("Mandate %s was cancelled before execution started", mandate_id)
+            return {
+                "mandate_id": mandate_id,
+                "status": "cancelled",
+                "agent_reasoning": "Mandate cancelled before execution started",
+                "order_id": None,
+                "authorization_id": None,
+                "capture_id": None,
+                "amount": None,
+                "currency": None,
+                "product_name": None,
+                "error": None,
+            }
 
         # Update status → searching
         update_mandate_status(mandate_id, "searching")
@@ -108,6 +177,23 @@ class AgentOrchestrator:
 
         try:
             for turn in range(MAX_TURNS):
+                if self._is_cancelled(mandate_id):
+                    logger.info("Mandate %s was cancelled during turn %d; aborting", mandate_id, turn + 1)
+                    if result.get("authorization_id") and result.get("status") == "authorized":
+                        try:
+                            self.paypal.void_authorization(result["authorization_id"])
+                            log_transaction(
+                                mandate_id=mandate_id,
+                                user_id=mandate_dict.get("user_id"),
+                                event_type="voided",
+                                paypal_resource_id=result["authorization_id"],
+                                details={"reason": "cancelled_during_turn"},
+                            )
+                        except Exception as void_err:
+                            logger.error("Failed to void authorization during cancellation: %s", void_err)
+                    result["status"] = "cancelled"
+                    break
+
                 logger.info("Agent turn %d/%d for mandate %s", turn + 1, MAX_TURNS, mandate_id)
 
                 response = await self.ai.chat_with_tools(messages, AGENT_TOOLS)
@@ -133,6 +219,11 @@ class AgentOrchestrator:
 
                 # Execute each tool call
                 for tc in tool_calls:
+                    if self._is_cancelled(mandate_id):
+                        logger.info("Mandate %s was cancelled before tool dispatch; aborting", mandate_id)
+                        result["status"] = "cancelled"
+                        break
+
                     fn_name = tc.get("name", "")
                     fn_args_raw = tc.get("arguments", {})
                     tc_id = tc.get("id", fn_name)
@@ -158,6 +249,15 @@ class AgentOrchestrator:
                         "content": json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result,
                     })
 
+                if self._is_cancelled(mandate_id):
+                    result["status"] = "cancelled"
+                    break
+
+            if self._is_cancelled(mandate_id) or result.get("status") == "cancelled":
+                logger.info("Mandate %s ended in cancelled state; preserving without overwrite", mandate_id)
+                result["status"] = "cancelled"
+                return result
+
             # Final status update
             extra_fields: dict[str, Any] = {
                 "agent_reasoning": result.get("agent_reasoning"),
@@ -169,14 +269,39 @@ class AgentOrchestrator:
             if result.get("amount"):
                 extra_fields["executed_amount"] = result["amount"]
 
-            update_mandate_status(mandate_id, result["status"], extra_fields)
+            if not self._is_cancelled(mandate_id):
+                update_mandate_status(mandate_id, result["status"], extra_fields)
+            else:
+                result["status"] = "cancelled"
             logger.info("Agent finished mandate %s — status=%s", mandate_id, result["status"])
 
+        except asyncio.CancelledError:
+            logger.info("Execution task for mandate %s cancelled via asyncio", mandate_id)
+            self.cancel_mandate(mandate_id)
+            if result.get("authorization_id") and result.get("status") == "authorized":
+                try:
+                    self.paypal.void_authorization(result["authorization_id"])
+                    log_transaction(
+                        mandate_id=mandate_id,
+                        user_id=mandate_dict.get("user_id"),
+                        event_type="voided",
+                        paypal_resource_id=result["authorization_id"],
+                        details={"reason": "asyncio_task_cancelled"},
+                    )
+                except Exception as void_err:
+                    logger.error("Failed to void authorization on task cancellation: %s", void_err)
+            result["status"] = "cancelled"
+            raise
         except Exception as exc:
             logger.exception("Agent execution failed for mandate %s", mandate_id)
             result["status"] = "failed"
             result["error"] = str(exc)
-            update_mandate_status(mandate_id, "failed", {"agent_reasoning": f"Error: {exc}"})
+            if not self._is_cancelled(mandate_id):
+                update_mandate_status(mandate_id, "failed", {"agent_reasoning": f"Error: {exc}"})
+            else:
+                result["status"] = "cancelled"
+        finally:
+            self._cancelled_mandates.discard(mandate_id)
 
         return result
 
@@ -192,6 +317,9 @@ class AgentOrchestrator:
         result: dict[str, Any],
     ) -> Any:
         """Dispatch a tool call to the appropriate handler."""
+        if self._is_cancelled(mandate.get("id", "")):
+            return {"error": "Mandate execution was cancelled"}
+
         handlers = {
             "search_products": self._search_products,
             "check_mandate_policy": self._check_policy_wrapper,
@@ -218,10 +346,13 @@ class AgentOrchestrator:
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
         """Mock product search — returns realistic fake data for the demo."""
+        if self._is_cancelled(mandate.get("id", "")):
+            return {"error": "Mandate execution was cancelled"}
+
         update_mandate_status(mandate["id"], "searching")
 
         query = args.get("query", "")
-        category = args.get("category", "general")
+        category = normalize_category(args.get("category", "general"))
         max_price = args.get("max_price") or (mandate.get("constraints") or {}).get("max_price") or 500
         currency = args.get("currency", "USD")
 
@@ -230,7 +361,8 @@ class AgentOrchestrator:
 
         log_transaction(
             mandate_id=mandate["id"],
-            event_type="PRODUCT_SEARCH",
+            user_id=mandate.get("user_id"),
+            event_type="search_started",
             status="completed",
             details={"query": query, "results_count": len(products)},
         )
@@ -241,15 +373,20 @@ class AgentOrchestrator:
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
         """Check mandate policy and return approval/rejection."""
+        if self._is_cancelled(mandate.get("id", "")):
+            return {"decision": "REJECTED", "reason": "Mandate execution was cancelled"}
+
         update_mandate_status(mandate["id"], "evaluating")
         policy_result = self._check_policy(args, mandate)
 
+        evt = "policy_approved" if policy_result.get("decision") == "APPROVED" else "policy_rejected"
         log_transaction(
             mandate_id=mandate["id"],
-            event_type="POLICY_CHECK",
+            user_id=mandate.get("user_id"),
+            event_type=evt,
             amount=args.get("price"),
             currency=args.get("currency", "USD"),
-            status=policy_result["decision"],
+            status=policy_result.get("decision"),
             details={
                 "product_name": args.get("product_name"),
                 "justification": args.get("justification"),
@@ -298,11 +435,14 @@ class AgentOrchestrator:
         if required_category and not category:
             return {"decision": "REJECTED", "reason": "Purchase category is required"}
         if required_category and category:
-            if required_category.lower() not in category.lower() and category.lower() not in required_category.lower():
-                return {
-                    "decision": "REJECTED",
-                    "reason": f"Category '{category}' does not match required '{required_category}'",
-                }
+            norm_req = normalize_category(required_category)
+            norm_actual = normalize_category(category)
+            if norm_req != "general" and norm_actual != "general" and norm_req != norm_actual:
+                if norm_req not in norm_actual and norm_actual not in norm_req:
+                    return {
+                        "decision": "REJECTED",
+                        "reason": f"Category '{category}' does not match required '{required_category}'",
+                    }
 
         # Check deadline
         deadline = constraints.get("deadline")
@@ -342,6 +482,9 @@ class AgentOrchestrator:
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
         """Create and authorize a PayPal order."""
+        if self._is_cancelled(mandate.get("id", "")):
+            return {"error": "Mandate execution was cancelled"}
+
         amount = args.get("amount", 0)
         currency = args.get("currency", "USD")
         description = args.get("description", mandate.get("description", ""))
@@ -404,7 +547,8 @@ class AgentOrchestrator:
 
             log_transaction(
                 mandate_id=mandate_id,
-                event_type="ORDER_AUTHORIZED",
+                user_id=mandate.get("user_id"),
+                event_type="authorized",
                 paypal_order_id=order_id,
                 paypal_authorization_id=authorization_id,
                 amount=amount,
@@ -425,7 +569,8 @@ class AgentOrchestrator:
             logger.error("Order creation failed: %s", exc)
             log_transaction(
                 mandate_id=mandate_id,
-                event_type="ORDER_FAILED",
+                user_id=mandate.get("user_id"),
+                event_type="failed",
                 status="failed",
                 details={"error": str(exc)},
             )
@@ -435,6 +580,9 @@ class AgentOrchestrator:
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
         """Capture an authorized payment."""
+        if self._is_cancelled(mandate.get("id", "")):
+            return {"error": "Mandate execution was cancelled"}
+
         if (mandate.get("constraints") or {}).get("auto_execute") is not True:
             return {"error": "Manual approval required; agent capture is disabled"}
         authorization_id = result.get("authorization_id")
@@ -461,7 +609,8 @@ class AgentOrchestrator:
 
             log_transaction(
                 mandate_id=mandate["id"],
-                event_type="PAYMENT_CAPTURED",
+                user_id=mandate.get("user_id"),
+                event_type="captured",
                 paypal_authorization_id=authorization_id,
                 paypal_capture_id=capture_id,
                 amount=result.get("amount"),
@@ -475,7 +624,8 @@ class AgentOrchestrator:
             logger.error("Capture failed: %s", exc)
             log_transaction(
                 mandate_id=mandate["id"],
-                event_type="CAPTURE_FAILED",
+                user_id=mandate.get("user_id"),
+                event_type="failed",
                 paypal_authorization_id=authorization_id,
                 status="failed",
                 details={"error": str(exc)},
@@ -500,7 +650,9 @@ class AgentOrchestrator:
 
             log_transaction(
                 mandate_id=mandate["id"],
-                event_type="AUTHORIZATION_VOIDED",
+                user_id=mandate.get("user_id"),
+                event_type="voided",
+                paypal_resource_id=authorization_id,
                 paypal_authorization_id=authorization_id,
                 status="voided",
             )
@@ -579,7 +731,7 @@ def _generate_mock_products(
     }
 
     # Pick the best matching template
-    category_lower = category.lower() if category else "general"
+    category_lower = normalize_category(category)
     template_key = "general"
     for key in templates:
         if key in category_lower or key in query.lower():

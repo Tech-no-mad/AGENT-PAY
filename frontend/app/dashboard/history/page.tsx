@@ -21,6 +21,7 @@ const eventBadgeConfig: Record<
   string,
   { label: string; bg: string; text: string; icon: any }
 > = {
+  // Uppercase legacy / UI keys
   MANDATE_CREATED: {
     label: "Created",
     bg: "bg-blue-500/10 border-blue-500/20",
@@ -86,6 +87,74 @@ const eventBadgeConfig: Record<
     bg: "bg-red-500/10 border-red-500/20",
     text: "text-red-400",
     icon: AlertCircle,
+  },
+
+  // Lowercase schema check constraint events (BUG-9)
+  mandate_created: {
+    label: "Created",
+    bg: "bg-blue-500/10 border-blue-500/20",
+    text: "text-blue-400",
+    icon: Clock,
+  },
+  search_started: {
+    label: "Catalog Search",
+    bg: "bg-yellow-500/10 border-yellow-500/20",
+    text: "text-yellow-400",
+    icon: Search,
+  },
+  deal_found: {
+    label: "Deal Found",
+    bg: "bg-cyan-500/10 border-cyan-500/20",
+    text: "text-cyan-400",
+    icon: CheckCircle,
+  },
+  policy_approved: {
+    label: "Policy Pass",
+    bg: "bg-emerald-500/10 border-emerald-500/20",
+    text: "text-emerald-400",
+    icon: ShieldCheck,
+  },
+  policy_rejected: {
+    label: "Policy Reject",
+    bg: "bg-red-500/10 border-red-500/20",
+    text: "text-red-400",
+    icon: XCircle,
+  },
+  order_created: {
+    label: "Order Created",
+    bg: "bg-purple-500/10 border-purple-500/20",
+    text: "text-purple-400",
+    icon: CreditCard,
+  },
+  authorized: {
+    label: "Authorized",
+    bg: "bg-purple-500/10 border-purple-500/20",
+    text: "text-purple-400",
+    icon: ShieldCheck,
+  },
+  captured: {
+    label: "Captured",
+    bg: "bg-green-500/10 border-green-500/20",
+    text: "text-green-400",
+    icon: CheckCircle,
+  },
+  voided: {
+    label: "Voided",
+    bg: "bg-gray-500/10 border-gray-500/20",
+    text: "text-gray-400",
+    icon: XCircle,
+  },
+  failed: {
+    label: "Failed",
+    bg: "bg-red-500/10 border-red-500/20",
+    text: "text-red-400",
+    icon: AlertCircle,
+  },
+  refunded: {
+    label: "Refunded",
+    bg: "bg-amber-500/10 border-amber-500/20",
+    text: "text-amber-400",
+    icon: RefreshCw,
   },
 };
 
@@ -184,12 +253,15 @@ export default function HistoryPage() {
               </thead>
               <tbody className="divide-y divide-gray-800/60">
                 {filtered.map((tx) => {
-                  const badge = eventBadgeConfig[tx.event_type] || {
-                    label: tx.event_type,
-                    bg: "bg-gray-800",
-                    text: "text-gray-300",
-                    icon: Clock,
-                  };
+                  const badge =
+                    eventBadgeConfig[tx.event_type] ||
+                    eventBadgeConfig[tx.event_type.toLowerCase()] ||
+                    eventBadgeConfig[tx.event_type.toUpperCase()] || {
+                      label: tx.event_type,
+                      bg: "bg-gray-800",
+                      text: "text-gray-300",
+                      icon: Clock,
+                    };
                   const Icon = badge.icon;
 
                   return (
@@ -235,6 +307,8 @@ export default function HistoryPage() {
                           <span className="text-purple-400">Auth: {tx.paypal_authorization_id.slice(0, 10)}...</span>
                         ) : tx.paypal_order_id ? (
                           <span className="text-sky-400">Ord: {tx.paypal_order_id.slice(0, 10)}...</span>
+                        ) : tx.paypal_resource_id ? (
+                          <span className="text-purple-400">Ref: {tx.paypal_resource_id.slice(0, 10)}...</span>
                         ) : (
                           "—"
                         )}
