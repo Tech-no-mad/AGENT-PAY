@@ -7,12 +7,12 @@ from __future__ import annotations
 
 import logging
 import math
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 from supabase import Client, create_client
 
 from backend.config import settings
+from backend.services.time_utils import utc_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ def update_mandate_status(
     sb = supabase_client if supabase_client is not None else get_supabase()
     payload: dict[str, Any] = {
         "status": status,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": utc_timestamp(),
     }
     if extra_fields:
         payload.update(extra_fields)
@@ -173,7 +173,7 @@ def log_transaction(
             "mandate_id": mandate_id, "user_id": user_id, "event_type": normalized,
             "paypal_resource_id": paypal_resource_id or paypal_capture_id or paypal_authorization_id or paypal_order_id,
             "amount": amount, "currency": currency or "USD", "details": metadata,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": utc_timestamp(),
         }
         result = sb.table("transactions").insert(row).execute()
         if not result.data:

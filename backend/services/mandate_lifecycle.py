@@ -1,10 +1,10 @@
 """Durable payment/cancellation coordination using atomic conditional row updates."""
 
-from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from backend.services.supabase_client import log_transaction
+from backend.services.time_utils import utc_timestamp
 
 
 class ExecutionStopped(RuntimeError):
@@ -50,7 +50,7 @@ class MandateLifecycle:
                    "void": ["active", "searching", "evaluating", "authorized", "failed"]}[operation]
         query = (self.sb.table("mandates").update({
             "payment_operation": operation, "payment_operation_id": str(uuid4()),
-            "payment_started_at": datetime.now(timezone.utc).isoformat(),
+            "payment_started_at": utc_timestamp(),
         }).eq("id", mandate_id).in_("status", allowed).is_("payment_operation_id", "null"))
         if operation != "void":
             query = query.eq("cancel_requested", False)

@@ -2,6 +2,7 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import json
 from threading import Barrier
 from types import SimpleNamespace
@@ -34,7 +35,8 @@ def database(mandate):
 
 
 def extracted(**overrides):
-    return {"max_price": 150, "currency": "EUR", "category": "electronics", "deadline": "2030-12-01T00:00:00Z",
+    future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+    return {"max_price": 150, "currency": "EUR", "category": "electronics", "deadline": future,
             "auto_execute": False, "additional_rules": "No used items", **overrides}
 
 
@@ -96,10 +98,11 @@ def test_failed_provider_response_does_not_enable_execution():
 
 def test_valid_extraction_preserves_all_restrictions():
     ai = CloudflareAI("account", "token")
-    ai.chat_with_tools = AsyncMock(return_value={"result": {"response": "```json\n" + json.dumps(extracted()) + "\n```"}})
+    expected = extracted()
+    ai.chat_with_tools = AsyncMock(return_value={"result": {"response": "```json\n" + json.dumps(expected) + "\n```"}})
     parsed = asyncio.run(ai.parse_mandate("buy"))
     assert parsed["max_price"] == 150 and parsed["auto_execute"] is False
-    assert parsed["deadline"] == "2030-12-01T00:00:00+00:00" and parsed["additional_rules"] == "No used items"
+    assert parsed["deadline"] == expected["deadline"] and parsed["additional_rules"] == "No used items"
 
 
 def service_for(database, parsed):
@@ -118,11 +121,12 @@ def create_and_wait(service, constraints):
 
 def test_partial_ui_constraints_do_not_drop_description_limits():
     database = FakeSupabase()
-    service = service_for(database, extracted())
+    expected = extracted()
+    service = service_for(database, expected)
     row = create_and_wait(service, {"category": "product", "auto_execute": True})
     assert row["constraints"]["max_price"] == 150
     assert row["constraints"]["currency"] == "EUR"
-    assert row["constraints"]["deadline"] == "2030-12-01T00:00:00+00:00"
+    assert row["constraints"]["deadline"] == expected["deadline"]
     assert row["constraints"]["category"] == "physical_goods"
     assert row["constraints"]["auto_execute"] is True
     assert row["constraints"]["additional_rules"] == "No used items"
@@ -138,6 +142,25 @@ def test_explicit_limits_override_parsed_values_and_null_does_not_clear_restrict
 def test_explicit_budget_can_complete_valid_extraction_with_no_instruction_budget():
     row = create_and_wait(service_for(FakeSupabase(), extracted(max_price=None)), {"max_price": 75})
     assert row["constraints"]["max_price"] == 75
+
+
+def test_expired_purchase_deadline_does_not_insert_or_start_a_worker():
+    database = FakeSupabase()
+    expired = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    service = service_for(database, extracted(deadline=expired))
+    with pytest.raises(ValueError, match="deadline has already passed"):
+        create_and_wait(service, {})
+    assert database.table("mandates").select("*").execute().data == []
+    service.orchestrator.execute_mandate.assert_not_awaited()
+
+
+def test_future_explicit_deadline_can_override_stale_extraction():
+    expired = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    future = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    service = service_for(FakeSupabase(), extracted(deadline=expired))
+    row = create_and_wait(service, {"deadline": future})
+    assert row["constraints"]["deadline"] == future
+    service.orchestrator.execute_mandate.assert_awaited_once()
 
 
 def test_route_passes_only_explicit_fields_for_merge():

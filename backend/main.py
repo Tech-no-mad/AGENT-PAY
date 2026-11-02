@@ -5,6 +5,7 @@ AgentPay Backend — FastAPI Application Entry Point.
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -17,10 +18,17 @@ from backend.routes.mandates import router as mandates_router
 from backend.routes.vault import router as vault_router
 from backend.routes.webhooks import router as webhooks_router
 
-# Configure logging
+# Log each record's actual creation time in UTC, with an explicit zone.
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s.%(msecs)03dZ [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+_log_formatter.converter = time.gmtime
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(_log_formatter)
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[_log_handler],
 )
 logger = logging.getLogger("agentpay")
 

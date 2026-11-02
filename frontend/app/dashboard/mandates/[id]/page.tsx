@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import StatusBadge from "@/components/StatusBadge";
 import AgentActivityLog from "@/components/AgentActivityLog";
+import { formatTimestamp } from "@/lib/time";
 import {
   cancelMandate,
   getMandate,
@@ -132,7 +133,9 @@ export default function MandateDetailPage() {
               <StatusBadge status={mandate.status} />
             </div>
             <p className="text-xs text-gray-500 mt-0.5">
-              Created {new Date(mandate.created_at).toLocaleString()}
+              Created <time dateTime={mandate.created_at} title={mandate.created_at}>
+                {formatTimestamp(mandate.created_at)}
+              </time>
             </p>
           </div>
         </div>

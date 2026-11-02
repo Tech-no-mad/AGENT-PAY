@@ -22,7 +22,7 @@ from paypalserversdk.models.amount_with_breakdown import AmountWithBreakdown
 from paypalserversdk.models.checkout_payment_intent import CheckoutPaymentIntent
 from paypalserversdk.models.order_request import OrderRequest
 from paypalserversdk.models.payment_source import PaymentSource
-from paypalserversdk.models.token import Token
+from paypalserversdk.models.paypal_wallet import PaypalWallet
 from paypalserversdk.models.purchase_unit_request import PurchaseUnitRequest
 from paypalserversdk.paypal_serversdk_client import PaypalServersdkClient
 from paypalserversdk.configuration import Environment
@@ -30,6 +30,10 @@ from paypalserversdk.configuration import Environment
 from backend.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class PayPalOrderBuildError(ValueError):
+    """The order could not be constructed; no PayPal request was sent."""
 
 
 class PayPalService:
@@ -159,27 +163,32 @@ class PayPalService:
         request_id: Optional[str] = None,
     ) -> Any:
         """Create an order with AUTHORIZE intent using a vaulted payment token."""
-        order_body = OrderRequest(
-            intent=CheckoutPaymentIntent.AUTHORIZE,
-            purchase_units=[
-                PurchaseUnitRequest(
-                    amount=AmountWithBreakdown(
-                        currency_code=currency,
-                        value=f"{amount:.2f}",
-                    ),
-                    description=description,
-                    custom_id=mandate_id,
-                )
-            ],
-            payment_source=PaymentSource(
-                token=Token(
-                    id=payment_token_id,
-                    type="PAYMENT_METHOD_TOKEN",
-                ),
-            ),
-        )
         try:
-            result = self._orders_controller.orders_create({"body": order_body, "paypal_request_id": request_id})
+            order_body = OrderRequest(
+                intent=CheckoutPaymentIntent.AUTHORIZE,
+                purchase_units=[
+                    PurchaseUnitRequest(
+                        amount=AmountWithBreakdown(
+                            currency_code=currency,
+                            value=f"{amount:.2f}",
+                        ),
+                        description=description,
+                        custom_id=mandate_id,
+                    ),
+                ],
+                payment_source=PaymentSource(
+                    paypal=PaypalWallet(vault_id=payment_token_id),
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            # Keep this boundary before the SDK controller: failures after
+            # submission may have moved funds and must remain uncertain.
+            raise PayPalOrderBuildError(f"Could not build PayPal order request: {exc}") from exc
+        try:
+            result = self._orders_controller.orders_create({
+                "body": order_body, "paypal_request_id": request_id,
+                "prefer": "return=representation",
+            })
             logger.info("Order created: %s", result.body.id if result.body else "unknown")
             return result.body
         except Exception as exc:
@@ -189,7 +198,10 @@ class PayPalService:
     def authorize_order(self, order_id: str, request_id: Optional[str] = None) -> Any:
         """Authorize a created order."""
         try:
-            result = self._orders_controller.orders_authorize({"id": order_id, "paypal_request_id": request_id})
+            result = self._orders_controller.orders_authorize({
+                "id": order_id, "paypal_request_id": request_id,
+                "prefer": "return=representation",
+            })
             logger.info("Order authorized: %s", order_id)
             return result.body
         except Exception as exc:

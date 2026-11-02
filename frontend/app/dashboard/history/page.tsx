@@ -16,6 +16,7 @@ import {
   ArrowRight,
 } from "lucide-react";
 import { getTransactions, Transaction } from "@/lib/api";
+import { formatTimestamp } from "@/lib/time";
 
 const eventBadgeConfig: Record<
   string,
@@ -264,14 +265,12 @@ export default function HistoryPage() {
                   return (
                     <tr key={tx.id} className="hover:bg-gray-800/30 transition-colors">
                       <td className="py-3 px-4 text-gray-400 whitespace-nowrap">
-                        {new Date(tx.created_at).toLocaleTimeString([], {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                          second: "2-digit",
-                        })}{" "}
-                        <span className="text-[10px] text-gray-600 block">
-                          {new Date(tx.created_at).toLocaleDateString()}
-                        </span>
+                        <time dateTime={tx.created_at} title={tx.created_at}>
+                          {formatTimestamp(tx.created_at, "time")}
+                          <span className="text-[10px] text-gray-600 block">
+                            {formatTimestamp(tx.created_at, "date")}
+                          </span>
+                        </time>
                       </td>
 
                       <td className="py-3 px-4">

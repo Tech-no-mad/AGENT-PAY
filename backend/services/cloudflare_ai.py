@@ -12,6 +12,7 @@ from typing import Any, Optional
 import httpx
 from backend.models.schemas import ExtractedMandateConstraints
 from backend.services.categories import CATEGORIES
+from backend.services.time_utils import utc_now
 
 from backend.config import settings
 
@@ -59,16 +60,30 @@ class CloudflareAI:
         """
         payload: dict[str, Any] = {
             "messages": messages,
-            "tools": tools,
         }
+        # Workers AI rejects tools=[]; extraction needs a plain chat request.
+        if tools:
+            payload["tools"] = tools
 
         last_error: Optional[Exception] = None
         for attempt in range(_MAX_RETRIES):
             try:
                 async with httpx.AsyncClient(timeout=60.0) as http:
+                    # Refresh the clock for every extraction, agent turn and retry.
+                    # Copy the first message so historical conversation is not mutated.
+                    now = utc_now()
+                    clock_context = f"Current UTC date and time: {now.isoformat()} ({now:%A})."
+                    request_messages = list(messages)
+                    if request_messages and request_messages[0].get("role") == "system":
+                        request_messages[0] = {
+                            **request_messages[0],
+                            "content": clock_context + "\n\n" + (request_messages[0].get("content") or ""),
+                        }
+                    else:
+                        request_messages.insert(0, {"role": "system", "content": clock_context})
                     resp = await http.post(
                         self._base_url,
-                        json=payload,
+                        json={**payload, "messages": request_messages},
                         headers={
                             "Authorization": f"Bearer {self.api_token}",
                             "Content-Type": "application/json",
@@ -127,16 +142,24 @@ class CloudflareAI:
         """
         system_prompt = (
             "You are a JSON extraction assistant. Given a natural-language spending mandate, "
-            "extract structured constraints. Respond with ONLY a valid JSON object (no markdown, no explanation) "
+            "extract structured constraints. Resolve relative dates such as 'this Friday' using the current "
+            "UTC date and time in the system context, never a year from training data. "
+            "Respond with ONLY a valid JSON object (no markdown, no explanation) "
             "with these fields:\n"
             '  "max_price": number or null,\n'
             '  "currency": string (ISO 4217, default "USD"),\n'
             '  "category": string or null,\n'
-            '  "deadline": string (ISO 8601) or null,\n'
+            '  "deadline": string (ISO 8601 date-time with timezone) or null,\n'
             '  "auto_execute": boolean (default true),\n'
             '  "additional_rules": string or null\n'
             f"Use canonical broad categories where applicable: {', '.join(CATEGORIES)}. "
             "Never invent a budget or deadline. Use null when none is specified. "
+            "deadline means an explicitly requested latest time to COMPLETE THE PURCHASE, such as 'buy by Friday'. "
+            "Departure dates, hotel check-in dates, event dates, and delivery dates are product requirements, "
+            "not purchase deadlines: preserve them with resolved ISO calendar dates in additional_rules. "
+            "For example, 'book a flight departing this Friday' has deadline=null; keep its departure date in additional_rules. "
+            "Use UTC unless the instructions specify a timezone. For an explicit purchase deadline with a date "
+            "but no time, use 23:59:59 on that date in the applicable timezone. "
             "Use auto_execute=false if approval is requested. Include all six fields."
         )
 
