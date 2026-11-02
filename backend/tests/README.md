@@ -28,6 +28,14 @@ and product name. The UI and API use `payment_tokens.id`; the backend resolves a
 active token owned by the buyer to its PayPal vault identifier immediately before
 creating the order.
 
+`test_paypal_sdk.py` runs the installed SDK's actual models, request serialization,
+controllers, and response parsing against a stubbed HTTP transport. Wallet orders
+use `payment_source.paypal.vault_id` and `AUTHORIZE` intent. Create and authorize
+request full responses so the authorization ID is available before capture.
+Local model-construction errors record a failed operation and release its claim;
+errors after submission retain the claim until the payment outcome is reconciled.
+These tests do not contact PayPal or create sandbox payments.
+
 Agent capture requires `constraints.auto_execute` to be explicitly true and uses
 the authorization created by the current execution. Authorization-only payments
 remain authorized. Completion requires a PayPal capture with status COMPLETED.
@@ -37,9 +45,9 @@ This change does not add a separate human approval/capture endpoint.
 
 `test_remaining_review_findings.py` covers BUG-9, BUG-10, BUG-11, BUG-12, BUG-14,
 and BUG-15: the audit schema, cancellation races, partial constraint merging,
-failed extraction, retryable voids, and category matching. The suite currently
-contains 123 tests in total, including the original 34 security regressions,
-the scenarios merged from main, and the main-integration regression tests.
+failed extraction, retryable voids, and category matching. These run alongside
+the original security regressions, main-integration regressions, Cloudflare
+request contracts, and timestamp/deadline tests.
 
 Extraction must return a complete, typed object. Invalid JSON/shape/values or a
 failed provider response raises an error before mandate insertion or worker
@@ -52,6 +60,30 @@ the frontend and backend. Ship the `shared/` directory with both deployments.
 Legacy `product`, `flight`, and `service` inputs remain accepted aliases. Broad
 physical-goods mandates permit electronics/general results; category matching is
 explicit rather than arbitrary substring matching.
+
+## Timestamp and deadline conventions
+
+Runtime timestamps come from `backend/services/time_utils.py`: every call reads
+the current UTC clock and serializes an ISO-8601 timestamp with an explicit
+offset. Database-generated creation/update times use PostgreSQL `now()` in
+`timestamptz` columns. Backend log lines use UTC with a `Z` suffix. PayPal's signed
+transmission timestamp and historical audit timestamps retain their original
+meaning; they are not replaced with the current time when read or displayed.
+
+Every Cloudflare HTTP attempt receives fresh current-time context, including
+retries and later decision turns, without modifying stored conversation history.
+Relative dates are resolved in UTC unless the instructions specify a timezone.
+Travel/event dates are preserved as product requirements, while an explicit
+deadline is the latest time to complete the purchase. Saved absolute dates do
+not move as time advances. New expired mandates are rejected before insertion;
+authorization and capture recheck the current clock and reject at or after the
+deadline. Expired capture leaves the authorization available for cancellation.
+
+Frontend creation/activity/history views format recorded instants in the
+browser's timezone, with timezone labels on times. Missing or ambiguous timestamps
+display `Time unavailable` rather than a guessed time. Fixed dates in tests are
+deliberate frozen-clock or invalid/expired cases; valid rolling-deadline fixtures
+are generated relative to the test's current clock.
 
 ## Cancellation migration and operation
 

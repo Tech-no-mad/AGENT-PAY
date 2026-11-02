@@ -14,6 +14,7 @@ from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.cloudflare_ai import CloudflareAI
 from backend.services.mandate_lifecycle import CancellationFailed, CancellationPending, MandateLifecycle
 from backend.services.supabase_client import AuditLogError, log_transaction, update_mandate_status, resolve_payment_token
+from backend.services.time_utils import parse_utc_timestamp, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,9 @@ class MandateService:
         }).model_dump()
         if constraints["max_price"] is None:
             raise ValueError("A positive budget is required in the instructions or explicit constraints")
+        deadline = constraints.get("deadline")
+        if deadline and parse_utc_timestamp(deadline) <= utc_now():
+            raise ValueError("Purchase deadline has already passed; provide a future deadline")
 
         mandate_row = {
             "user_id": user_id,

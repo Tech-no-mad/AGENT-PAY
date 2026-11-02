@@ -15,7 +15,6 @@ import json
 import logging
 import random
 import math
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 from backend.services.cloudflare_ai import CloudflareAI
@@ -23,8 +22,9 @@ from backend.services.categories import category_allowed, normalize_category
 from backend.services.mandate_lifecycle import (
     MandateLifecycle, ExecutionStopped, CancellationPending, CancellationFailed, PaymentOutcomeUnknown, field,
 )
-from backend.services.paypal_service import PayPalService
+from backend.services.paypal_service import PayPalOrderBuildError, PayPalService
 from backend.services.supabase_client import AuditLogError, get_supabase, resolve_payment_token, log_transaction, update_mandate_status
+from backend.services.time_utils import parse_utc_timestamp, utc_now
 from backend.tools.agent_tools import AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,9 @@ payment — all without human intervention.
 8. Never exceed the max_price constraint.
 9. Prefer lower prices when quality is comparable.
 10. Always provide clear reasoning for your choices.
+11. Use the supplied current UTC timestamp for time-sensitive decisions. Keep the \
+mandate's saved deadline and resolved travel/event dates fixed; do not shift them \
+by reinterpreting the original relative wording on later turns.
 
 ## Response Format
 After completing all actions, provide a brief summary of what you did and why.
@@ -132,9 +135,24 @@ class AgentOrchestrator:
                 # Parse the Cloudflare response
                 ai_result = response.get("result", {})
 
-                # Handle tool calls
-                tool_calls = ai_result.get("tool_calls")
-                response_text = ai_result.get("response", "")
+                # Prefer the full message: Cloudflare's flattened tool_calls
+                # omit IDs that must be preserved in the next request.
+                choices = ai_result.get("choices") or []
+                assistant_message = (choices[0].get("message") or {}) if choices else {}
+                response_text = assistant_message.get("content") or ai_result.get("response") or ""
+                raw_tool_calls = assistant_message.get("tool_calls") or ai_result.get("tool_calls") or []
+                tool_calls = []
+                for index, tc in enumerate(raw_tool_calls):
+                    function = tc.get("function") or tc
+                    arguments = function.get("arguments", {})
+                    tool_calls.append({
+                        "id": tc.get("id") or f"call_{turn}_{index}",
+                        "type": "function",
+                        "function": {
+                            "name": function.get("name", ""),
+                            "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
+                        },
+                    })
 
                 if not tool_calls:
                     # No more tool calls — agent is done
@@ -150,9 +168,9 @@ class AgentOrchestrator:
 
                 # Execute each tool call
                 for tc in tool_calls:
-                    fn_name = tc.get("name", "")
-                    fn_args_raw = tc.get("arguments", {})
-                    tc_id = tc.get("id", fn_name)
+                    fn_name = tc["function"]["name"]
+                    fn_args_raw = tc["function"]["arguments"]
+                    tc_id = tc["id"]
 
                     # Parse arguments
                     if isinstance(fn_args_raw, str):
@@ -340,17 +358,9 @@ class AgentOrchestrator:
                 }
 
         # Check deadline
-        deadline = constraints.get("deadline")
-        if deadline:
-            try:
-                deadline_dt = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
-                if datetime.now(timezone.utc) > deadline_dt:
-                    return {
-                        "decision": "REJECTED",
-                        "reason": "Mandate deadline has passed",
-                    }
-            except (ValueError, TypeError):
-                return {"decision": "REJECTED", "reason": "Invalid mandate deadline"}
+        deadline_error = self._deadline_error(constraints.get("deadline"))
+        if deadline_error:
+            return {"decision": "REJECTED", "reason": deadline_error}
 
         # Check additional_rules — basic keyword blocking
         additional_rules = constraints.get("additional_rules", "")
@@ -429,6 +439,13 @@ class AgentOrchestrator:
                 raise ValueError("PayPal authorization outcome is unknown")
         except (ExecutionStopped, CancellationPending, CancellationFailed):
             raise
+        except PayPalOrderBuildError as exc:
+            reason = str(exc)
+            self.lifecycle.finish(claim, status="failed", agent_reasoning=reason)
+            result.update(status="failed", error=reason, agent_reasoning=reason)
+            log_transaction(mandate["id"], "ORDER_FAILED", user_id=mandate["user_id"], supabase_client=self.sb,
+                            status="failed", details={"error": reason, "request_sent": False})
+            return {"error": reason, "status": "FAILED"}
         except Exception as exc:
             self.lifecycle.checkpoint(claim, agent_reasoning=f"Authorization requires reconciliation: {exc}")
             log_transaction(mandate["id"], "ORDER_FAILED", user_id=mandate["user_id"], supabase_client=self.sb,
@@ -462,6 +479,10 @@ class AgentOrchestrator:
             self.lifecycle.finish(claim)
             return {"error": "Current mandate does not permit capturing this authorization"}
         self._check_cancel_after_claim(claim)
+        deadline_error = self._deadline_error((claim.get("constraints") or {}).get("deadline"))
+        if deadline_error:
+            self.lifecycle.finish(claim, agent_reasoning=deadline_error)
+            return {"error": "Capture rejected by mandate deadline", "reason": deadline_error}
         try:
             captured = self.paypal.capture_authorization(authorization_id, request_id=claim["payment_operation_id"])
         except Exception as exc:
@@ -499,6 +520,19 @@ class AgentOrchestrator:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _deadline_error(deadline: Optional[str]) -> Optional[str]:
+        if not deadline:
+            return None
+        try:
+            deadline_dt = parse_utc_timestamp(deadline)
+            current_time = utc_now()
+            if deadline_dt <= current_time:
+                return f"Mandate deadline has passed ({deadline_dt.isoformat()}; now {current_time.isoformat()})"
+        except (ValueError, TypeError, AttributeError):
+            return "Invalid mandate deadline"
+        return None
+
+    @staticmethod
     def _build_user_message(mandate: dict[str, Any]) -> str:
         """Build the user message from mandate data."""
         constraints = mandate.get("constraints") or {}
@@ -509,7 +543,7 @@ class AgentOrchestrator:
         if constraints.get("category"):
             parts.append(f"Category: {constraints['category']}")
         if constraints.get("deadline"):
-            parts.append(f"Deadline: {constraints['deadline']}")
+            parts.append(f"Deadline to complete the purchase: {constraints['deadline']}")
         if constraints.get("auto_execute") is False:
             parts.append("Auto-execute is DISABLED — stop after authorization for user review.")
         if constraints.get("additional_rules"):

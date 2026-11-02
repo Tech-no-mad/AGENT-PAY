@@ -66,10 +66,11 @@ create table public.mandates (
     --   "max_price": 350.00,
     --   "currency": "USD",
     --   "category": "flight",
-    --   "deadline": "2026-11-01T00:00:00Z",
+    --   "deadline": null,
     --   "auto_execute": true,
-    --   "additional_rules": ["economy only", "non-stop preferred"]
+    --   "additional_rules": "economy only, non-stop preferred"
     -- }
+    -- An explicit purchase deadline is resolved at request time, with a timezone.
 
     status text default 'active'
         check (status in (

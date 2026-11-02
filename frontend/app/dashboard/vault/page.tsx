@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import {
   CreditCard,
@@ -22,6 +22,7 @@ import {
 
 export default function VaultPage() {
   const searchParams = useSearchParams();
+  const confirmingToken = useRef<string | null>(null);
   const [tokens, setTokens] = useState<VaultToken[]>([]);
   const [loading, setLoading] = useState(true);
   const [settingUp, setSettingUp] = useState(false);
@@ -43,17 +44,22 @@ export default function VaultPage() {
   };
 
   useEffect(() => {
-    fetchTokens();
-
     // Check if redirected back from PayPal approval
-    const isSuccess = searchParams.get("success");
+    const isSuccess = searchParams.get("success") === "true";
     const setupTokenId =
+      searchParams.get("approval_token_id") ||
+      searchParams.get("approval_session_id") ||
       searchParams.get("setup_token") ||
       searchParams.get("token") ||
       searchParams.get("setup_token_id");
 
     if (isSuccess && setupTokenId) {
-      handleConfirmReturn(setupTokenId);
+      if (confirmingToken.current !== setupTokenId) {
+        confirmingToken.current = setupTokenId;
+        handleConfirmReturn(setupTokenId);
+      }
+    } else {
+      fetchTokens();
     }
   }, [searchParams]);
 
@@ -65,8 +71,11 @@ export default function VaultPage() {
         type: "success",
         text: "PayPal payment method successfully vaulted!",
       });
-      fetchTokens();
+      // A refresh must not exchange the same approved setup token again.
+      window.history.replaceState(null, "", window.location.pathname);
+      await fetchTokens();
     } catch (err: any) {
+      await fetchTokens();
       setStatusMessage({
         type: "error",
         text: err.message || "Failed to confirm payment method with PayPal",

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Clock, DollarSign } from "lucide-react";
 import StatusBadge from "./StatusBadge";
 import type { Mandate } from "@/lib/api";
+import { formatTimestamp } from "@/lib/time";
 
 interface MandateCardProps {
   mandate: Mandate;
@@ -14,14 +15,6 @@ export default function MandateCard({ mandate }: MandateCardProps) {
   const router = useRouter();
   const maxAmount = typeof mandate.constraints?.max_price === "number"
     ? mandate.constraints.max_price : undefined;
-
-  const formatDate = (dateStr: string) => {
-    return new Date(dateStr).toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-    });
-  };
 
   const truncateDescription = (desc: string, maxLen = 120) => {
     if (desc.length <= maxLen) return desc;
@@ -47,7 +40,9 @@ export default function MandateCard({ mandate }: MandateCardProps) {
       <div className="flex items-center justify-between text-sm text-gray-500">
         <div className="flex items-center gap-1.5">
           <Clock className="w-3.5 h-3.5" />
-          <span>{formatDate(mandate.created_at)}</span>
+          <time dateTime={mandate.created_at} title={formatTimestamp(mandate.created_at)}>
+            {formatTimestamp(mandate.created_at, "date")}
+          </time>
         </div>
 
         {(maxAmount || mandate.executed_amount) && (

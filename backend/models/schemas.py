@@ -4,12 +4,12 @@ AgentPay Pydantic Models / Schemas.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from backend.services.categories import normalize_category
+from backend.services.time_utils import parse_utc_timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ class MandateConstraints(BaseModel):
     max_price: Optional[float] = Field(None, gt=0, description="Maximum allowed price")
     currency: str = Field("USD", pattern=r"^[A-Z]{3}$", description="ISO 4217 currency code")
     category: Optional[str] = Field(None, description="Product/service category")
-    deadline: Optional[str] = Field(None, description="ISO-8601 deadline for the purchase")
+    deadline: Optional[str] = Field(None, description="Latest purchase time as an ISO-8601 timestamp with timezone")
     auto_execute: StrictBool = Field(True, description="Automatically capture after authorization")
     additional_rules: Optional[str] = Field(None, description="Free-text rules the agent must respect")
 
@@ -47,10 +47,7 @@ class MandateConstraints(BaseModel):
     def aware_deadline(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            raise ValueError("Deadline must include a timezone")
-        return parsed.astimezone(timezone.utc).isoformat()
+        return parse_utc_timestamp(value).isoformat()
 
 
 class ExtractedMandateConstraints(MandateConstraints):

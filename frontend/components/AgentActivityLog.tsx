@@ -12,6 +12,7 @@ import {
   DollarSign,
 } from "lucide-react";
 import type { Transaction } from "@/lib/api";
+import { formatTimestamp } from "@/lib/time";
 
 interface AgentActivityLogProps {
   transactions: Transaction[];
@@ -73,16 +74,6 @@ export default function AgentActivityLog({
     }
   }, [transactions]);
 
-  const formatTime = (dateStr: string) => {
-    return new Date(dateStr).toLocaleString("en-US", {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    });
-  };
-
   if (transactions.length === 0) {
     return (
       <div className="text-center py-12 text-gray-500">
@@ -121,9 +112,9 @@ export default function AgentActivityLog({
                 <span className="text-sm font-medium text-gray-200 capitalize">
                   {tx.event_type.replace(/_/g, " ")}
                 </span>
-                <span className="text-xs text-gray-500 flex-shrink-0">
-                  {formatTime(tx.created_at)}
-                </span>
+                <time dateTime={tx.created_at} title={tx.created_at} className="text-xs text-gray-500 flex-shrink-0">
+                  {formatTimestamp(tx.created_at)}
+                </time>
               </div>
               <p className="text-sm text-gray-400">
                 {typeof tx.details === "string"
