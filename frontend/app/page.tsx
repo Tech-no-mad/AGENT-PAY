@@ -49,7 +49,7 @@ export default function LandingPage() {
           <div className="inline-flex items-center gap-2 bg-primary-500/10 border border-primary-500/20 rounded-full px-4 py-1.5 mb-8">
             <Zap className="w-4 h-4 text-primary-400" />
             <span className="text-sm text-primary-300 font-medium">
-              PayPal AI Hackathon 2024
+              PayPal AI Hackathon 2026
             </span>
           </div>
 
@@ -127,7 +127,7 @@ export default function LandingPage() {
             <span className="font-semibold text-gray-400">AgentPay</span>
           </div>
           <p className="text-sm text-gray-600">
-            Built for PayPal AI Hackathon 2024
+            Built for PayPal AI Hackathon 2026
           </p>
         </div>
       </footer>

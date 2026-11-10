@@ -103,6 +103,12 @@ const eventBadgeConfig: Record<
     text: "text-yellow-400",
     icon: Search,
   },
+  constraints_defined: {
+    label: "AI Pricing & Category",
+    bg: "bg-cyan-500/10 border-cyan-500/20",
+    text: "text-cyan-400",
+    icon: ShieldCheck,
+  },
   deal_found: {
     label: "Deal Found",
     bg: "bg-cyan-500/10 border-cyan-500/20",

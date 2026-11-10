@@ -2,7 +2,7 @@
 Agent Orchestrator — drives the AI agent loop that processes mandates.
 
 Flow:
-  1. System prompt + user message built from the mandate
+  1. Pricing/category agent defines and persists constraints before search
   2. Cloudflare AI called with tools in a loop (max 10 turns)
   3. Each tool_call is dispatched, results fed back
   4. Mandate status updated at every stage
@@ -13,18 +13,22 @@ from __future__ import annotations
 
 import json
 import logging
-import random
 import math
-from typing import Any, Optional
+import re
+from typing import Any, NoReturn, Optional
 
 from backend.services.cloudflare_ai import CloudflareAI
+from backend.services.errors import error_message
 from backend.services.categories import category_allowed, normalize_category
 from backend.services.mandate_lifecycle import (
     MandateLifecycle, ExecutionStopped, CancellationPending, CancellationFailed, PaymentOutcomeUnknown, field,
 )
 from backend.services.paypal_service import PayPalOrderBuildError, PayPalService
+from backend.services.pricing_category_agent import PricingCategoryAgent
+from backend.services.purchase_confirmation import PurchaseConfirmation, purchase_product
 from backend.services.supabase_client import AuditLogError, get_supabase, resolve_payment_token, log_transaction, update_mandate_status
 from backend.services.time_utils import parse_utc_timestamp, utc_now
+from backend.services.tool_calls import parse_tool_response
 from backend.tools.agent_tools import AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -46,9 +50,12 @@ payment — all without human intervention.
 1. ALWAYS call `search_products` first to find options.
 2. Pick the BEST option that satisfies the mandate.
 3. ALWAYS call `check_mandate_policy` BEFORE creating an order.
-4. If the policy check returns REJECTED, do NOT proceed — call `void_authorization` \
-   if an authorization exists, then stop and explain why.
+4. Any policy rejection permanently cancels this mandate. Never retry with
+   corrected arguments or a different product. The backend stops execution and
+   voids any existing authorization.
 5. If APPROVED, call `create_authorized_order` to hold funds.
+   The backend waits for the user's 10-second purchase confirmation before
+   authorization. Continue only with that exact product, currency and price.
 6. If auto_execute is true, immediately call `capture_authorized_payment`.
 7. If auto_execute is false, stop after authorization and let the user review.
 8. Never exceed the max_price constraint.
@@ -57,8 +64,14 @@ payment — all without human intervention.
 11. Use the supplied current UTC timestamp for time-sensitive decisions. Keep the \
 mandate's saved deadline and resolved travel/event dates fixed; do not shift them \
 by reinterpreting the original relative wording on later turns.
+12. Search results are demo catalog entries. Verify that the actual product and
+specifications match the request; never substitute an unrelated item just because
+it is in the same broad category. If no suitable option exists, stop and explain
+which requirement could not be met. A completed search is not a completed purchase.
 
 ## Response Format
+Use the provided tools to perform actions. Do not describe a tool call in your
+final answer. Send price, amount and max_price as JSON numbers, never strings.
 After completing all actions, provide a brief summary of what you did and why.
 """
 
@@ -73,6 +86,7 @@ class AgentOrchestrator:
         supabase_client: Any = None,
     ) -> None:
         self.ai = cloudflare_ai
+        self.pricing_agent = PricingCategoryAgent(cloudflare_ai)
         self.paypal = paypal_service
         self.sb = supabase_client
 
@@ -102,14 +116,6 @@ class AgentOrchestrator:
         mandate_id = mandate_dict["id"]
         logger.info("Agent starting execution for mandate %s", mandate_id)
 
-        constraints = mandate_dict.get("constraints") or {}
-        user_message = self._build_user_message(mandate_dict)
-
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ]
-
         result: dict[str, Any] = {
             "mandate_id": mandate_id,
             "status": "failed",
@@ -122,41 +128,51 @@ class AgentOrchestrator:
             "product_name": None,
             "error": None,
         }
+        stage = "pricing"
+        last_tool = None
+        last_tool_error = None
 
         try:
             self._refresh_running(mandate_dict)
-            update_mandate_status(mandate_id, "searching", supabase_client=self.sb)
+            constraints = await self.pricing_agent.define_constraints(
+                mandate_dict["description"], mandate_dict.get("constraints"),
+            )
+            self._refresh_running(mandate_dict)
+            updated = update_mandate_status(
+                mandate_id, "searching", {"constraints": constraints}, supabase_client=self.sb,
+            )
+            if not updated:
+                self._refresh_running(mandate_dict)
+                raise RuntimeError("Unable to persist AI pricing constraints")
+            mandate_dict.update(updated)
+            log_transaction(
+                mandate_id, "CONSTRAINTS_DEFINED", user_id=mandate_dict["user_id"],
+                status="completed", currency=constraints["currency"], details=constraints,
+                supabase_client=self.sb,
+            )
+            messages: list[dict[str, Any]] = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": self._build_user_message(mandate_dict)},
+            ]
+            stage = "shopping"
             for turn in range(MAX_TURNS):
                 logger.info("Agent turn %d/%d for mandate %s", turn + 1, MAX_TURNS, mandate_id)
 
+                stage = "shopping_model"
                 response = await self.ai.chat_with_tools(messages, AGENT_TOOLS)
                 self._refresh_running(mandate_dict)
 
-                # Parse the Cloudflare response
-                ai_result = response.get("result", {})
-
-                # Prefer the full message: Cloudflare's flattened tool_calls
-                # omit IDs that must be preserved in the next request.
-                choices = ai_result.get("choices") or []
-                assistant_message = (choices[0].get("message") or {}) if choices else {}
-                response_text = assistant_message.get("content") or ai_result.get("response") or ""
-                raw_tool_calls = assistant_message.get("tool_calls") or ai_result.get("tool_calls") or []
-                tool_calls = []
-                for index, tc in enumerate(raw_tool_calls):
-                    function = tc.get("function") or tc
-                    arguments = function.get("arguments", {})
-                    tool_calls.append({
-                        "id": tc.get("id") or f"call_{turn}_{index}",
-                        "type": "function",
-                        "function": {
-                            "name": function.get("name", ""),
-                            "arguments": arguments if isinstance(arguments, str) else json.dumps(arguments),
-                        },
-                    })
+                response_text, tool_calls = parse_tool_response(response, turn)
 
                 if not tool_calls:
-                    # No more tool calls — agent is done
+                    # Text alone never counts as a successful purchase.
                     result["agent_reasoning"] = response_text or result["agent_reasoning"]
+                    if result["status"] == "failed":
+                        reason = response_text or last_tool_error or (
+                            f"Shopping agent stopped after {last_tool or 'planning'} without authorizing a purchase"
+                        )
+                        result["error"] = f"No purchase was authorized. {reason}"
+                        result["agent_reasoning"] = result["error"]
                     break
 
                 # Add assistant message with tool calls to history
@@ -169,21 +185,16 @@ class AgentOrchestrator:
                 # Execute each tool call
                 for tc in tool_calls:
                     fn_name = tc["function"]["name"]
-                    fn_args_raw = tc["function"]["arguments"]
+                    fn_args = json.loads(tc["function"]["arguments"])
                     tc_id = tc["id"]
-
-                    # Parse arguments
-                    if isinstance(fn_args_raw, str):
-                        try:
-                            fn_args = json.loads(fn_args_raw)
-                        except json.JSONDecodeError:
-                            fn_args = {}
-                    else:
-                        fn_args = fn_args_raw
 
                     logger.info("Tool call: %s(%s)", fn_name, fn_args)
 
+                    last_tool = fn_name
+                    stage = fn_name
                     tool_result = await self._execute_tool(fn_name, fn_args, mandate_dict, result)
+                    if isinstance(tool_result, dict) and (tool_result.get("error") or tool_result.get("decision") == "REJECTED"):
+                        last_tool_error = tool_result.get("reason") or tool_result.get("error")
 
                     # Feed tool result back to the model
                     messages.append({
@@ -192,6 +203,10 @@ class AgentOrchestrator:
                         "tool_call_id": tc_id,
                         "content": json.dumps(tool_result) if not isinstance(tool_result, str) else tool_result,
                     })
+            else:
+                if result["status"] == "failed":
+                    result["error"] = f"Shopping agent reached the {MAX_TURNS}-turn limit without authorizing a purchase"
+                    result["agent_reasoning"] = result["error"]
 
             # Final status update
             extra_fields: dict[str, Any] = {
@@ -208,6 +223,13 @@ class AgentOrchestrator:
             updated = update_mandate_status(mandate_id, result["status"], extra_fields, supabase_client=self.sb)
             if not updated:
                 result["status"] = self.lifecycle.current(mandate_id)["status"]
+            elif result["status"] == "failed":
+                log_transaction(
+                    mandate_id, "MANDATE_FAILED", user_id=mandate_dict["user_id"],
+                    status="failed", details={"reason": result["error"], "stage": stage,
+                                              "last_tool": last_tool, "last_tool_error": last_tool_error},
+                    supabase_client=self.sb,
+                )
             logger.info("Agent finished mandate %s — status=%s", mandate_id, result["status"])
 
         except ExecutionStopped as exc:
@@ -215,16 +237,26 @@ class AgentOrchestrator:
             result["agent_reasoning"] = exc.mandate.get("agent_reasoning") or str(exc)
         except (CancellationPending, CancellationFailed, PaymentOutcomeUnknown) as exc:
             result["status"] = self.lifecycle.current(mandate_id)["status"]
-            result["error"] = str(exc)
+            result["error"] = error_message(exc)
         except Exception as exc:
             logger.exception("Agent execution failed for mandate %s", mandate_id)
-            result["error"] = str(exc)
+            reason = error_message(exc)
+            result["error"] = reason
+            result["agent_reasoning"] = reason
             current = self.lifecycle.current(mandate_id)
-            if current.get("payment_operation_id") or current.get("cancel_requested") or current["status"] in ("authorized", "completed", "cancelled"):
+            if current.get("payment_operation_id") or current.get("cancel_requested") or current["status"] in ("authorized", "completed", "cancelled", "failed"):
                 result["status"] = current["status"]
             else:
-                update_mandate_status(mandate_id, "failed", {"agent_reasoning": f"Error: {exc}"}, supabase_client=self.sb)
+                updated = update_mandate_status(mandate_id, "failed", {"agent_reasoning": reason}, supabase_client=self.sb)
                 result["status"] = self.lifecycle.current(mandate_id)["status"]
+                if updated:
+                    log_transaction(
+                        mandate_id, "MANDATE_FAILED", user_id=mandate_dict["user_id"],
+                        status="failed", details={"reason": reason, "stage": stage, "error_type": type(exc).__name__,
+                                                  "cause_type": type(exc.__cause__).__name__ if exc.__cause__ else None,
+                                                  "last_tool": last_tool, "last_tool_error": last_tool_error},
+                        supabase_client=self.sb,
+                    )
 
         return result
 
@@ -259,7 +291,7 @@ class AgentOrchestrator:
             raise
         except Exception as exc:
             logger.error("Tool %s failed: %s", name, exc)
-            return {"error": str(exc)}
+            return {"error": error_message(exc)}
 
     # ------------------------------------------------------------------
     # Tool implementations
@@ -271,10 +303,21 @@ class AgentOrchestrator:
         """Mock product search — returns realistic fake data for the demo."""
         update_mandate_status(mandate["id"], "searching", supabase_client=self.sb)
 
+        constraints = mandate.get("constraints") or {}
         query = args.get("query", "")
-        category = normalize_category(args.get("category", "general"))
-        max_price = args.get("max_price") or (mandate.get("constraints") or {}).get("max_price") or 500
-        currency = args.get("currency", "USD")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("A product search query is required")
+        category = normalize_category(args.get("category") or constraints.get("category"))
+        max_price = args.get("max_price") if args.get("max_price") is not None else constraints.get("max_price")
+        ceiling = constraints.get("max_price")
+        for amount in (max_price, ceiling):
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount <= 0:
+                raise ValueError("Product search requires a finite positive budget")
+        max_price = min(max_price, ceiling)
+        currency = args.get("currency") or constraints.get("currency", "USD")
+        if not isinstance(currency, str) or currency.upper() != constraints.get("currency", "USD").upper():
+            raise ValueError("Search currency must match the mandate")
+        currency = currency.upper()
 
         # Generate mock products based on query keywords
         products = _generate_mock_products(query, category, max_price, currency)
@@ -283,19 +326,41 @@ class AgentOrchestrator:
             mandate_id=mandate["id"],
             event_type="PRODUCT_SEARCH",
             status="completed",
-            details={"query": query, "results_count": len(products)},
+            details={"query": query, "category": category, "max_price": max_price,
+                     "currency": currency, "source": "demo_catalog", "results_count": len(products),
+                     "products": products},
             user_id=mandate["user_id"], supabase_client=self.sb,
         )
 
-        return {"products": products, "total_results": len(products)}
+        return {
+            "products": products, "total_results": len(products), "source": "demo_catalog",
+            "message": "Demo catalog results; verify product specifications before purchase." if products else
+                       "No matching demo products within the budget. Do not substitute an unrelated product; explain the unmet requirement.",
+        }
 
     async def _check_policy_wrapper(
         self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
     ) -> dict[str, Any]:
-        """Check mandate policy and return approval/rejection."""
+        """Return approval, or durably cancel and stop on the first rejection."""
+        self._refresh_running(mandate)
         update_mandate_status(mandate["id"], "evaluating", supabase_client=self.sb)
         policy_result = self._check_policy(args, mandate)
+        if policy_result["decision"] == "REJECTED":
+            self._reject_policy(args, mandate, result, policy_result)
 
+        self._log_policy(args, mandate, policy_result)
+        await self._confirm_purchase(args, mandate)
+        return policy_result
+
+    async def _confirm_purchase(self, args: dict[str, Any], mandate: dict[str, Any]) -> str:
+        confirmation = PurchaseConfirmation(self.lifecycle)
+        pending = confirmation.begin(mandate["id"], purchase_product(args))
+        approved = await confirmation.wait(mandate["id"], pending["purchase_confirmation_id"])
+        mandate.update(approved)
+        self._refresh_running(mandate)
+        return approved["purchase_confirmation_id"]
+
+    def _log_policy(self, args: dict[str, Any], mandate: dict[str, Any], policy_result: dict[str, Any]) -> None:
         log_transaction(
             mandate_id=mandate["id"],
             event_type="POLICY_CHECK",
@@ -310,7 +375,26 @@ class AgentOrchestrator:
             },
         )
 
-        return policy_result
+    def _reject_policy(
+        self, args: dict[str, Any], mandate: dict[str, Any], result: dict[str, Any],
+        policy_result: dict[str, Any], *, claim: Optional[dict[str, Any]] = None,
+    ) -> NoReturn:
+        """A rejected purchase ends the mandate, including batched/later retries."""
+        reason = f"Policy rejected: {policy_result['reason']}"
+        lifecycle = self.lifecycle
+        # Stop other workers before any audit write or claim release. In-flight
+        # payments continue through the existing cancellation/reconciliation path.
+        lifecycle.request_cancel(mandate["id"], mandate["user_id"], reason=reason)
+        if claim:
+            lifecycle.finish(claim)
+        try:
+            self._log_policy(args, mandate, policy_result)
+        finally:
+            # Even an audit outage must not leave a rejected hold capturable.
+            cancelled = lifecycle.cancel(mandate["id"], mandate["user_id"], reason=reason)
+        mandate.update(cancelled)
+        result.update(status=cancelled["status"], agent_reasoning=cancelled.get("agent_reasoning"))
+        raise ExecutionStopped(cancelled)
 
     def _check_policy(self, args: dict[str, Any], mandate: dict[str, Any]) -> dict[str, Any]:
         """
@@ -405,14 +489,17 @@ class AgentOrchestrator:
         amount = args.get("amount", 0)
         policy = self._check_policy({**args, "price": amount}, mandate)
         if policy["decision"] != "APPROVED":
-            return {"error": "Purchase rejected by mandate policy", "reason": policy["reason"]}
+            self._reject_policy({**args, "price": amount}, mandate, result, policy)
+        proposal = {**args, "price": amount}
+        if mandate.get("purchase_confirmation_product") != purchase_product(proposal):
+            self._log_policy(proposal, mandate, policy)
+        confirmation_id = await self._confirm_purchase(proposal, mandate)
         token = resolve_payment_token(self.lifecycle.sb, mandate["payment_token_id"], mandate["user_id"])
-        claim = self.lifecycle.claim(mandate["id"], "authorize")
+        claim = self.lifecycle.claim(mandate["id"], "authorize", confirmation_id=confirmation_id)
         # Constraints may have changed since the AI request was sent.
         policy = self._check_policy({**args, "price": amount}, claim)
         if policy["decision"] != "APPROVED":
-            self.lifecycle.finish(claim)
-            return {"error": "Purchase rejected by current mandate policy", "reason": policy["reason"]}
+            self._reject_policy({**args, "price": amount}, mandate, result, policy, claim=claim)
         self._check_cancel_after_claim(claim)
         currency = args.get("currency", "USD")
         description = args.get("description", mandate.get("description", ""))
@@ -481,8 +568,11 @@ class AgentOrchestrator:
         self._check_cancel_after_claim(claim)
         deadline_error = self._deadline_error((claim.get("constraints") or {}).get("deadline"))
         if deadline_error:
-            self.lifecycle.finish(claim, agent_reasoning=deadline_error)
-            return {"error": "Capture rejected by mandate deadline", "reason": deadline_error}
+            self._reject_policy(
+                {"price": result.get("amount"), "currency": result.get("currency"),
+                 "product_name": result.get("product_name")},
+                mandate, result, {"decision": "REJECTED", "reason": deadline_error}, claim=claim,
+            )
         try:
             captured = self.paypal.capture_authorization(authorization_id, request_id=claim["payment_operation_id"])
         except Exception as exc:
@@ -540,6 +630,13 @@ class AgentOrchestrator:
 
         if constraints.get("max_price"):
             parts.append(f"Maximum budget: ${constraints['max_price']:.2f} {constraints.get('currency', 'USD')}")
+        if constraints.get("min_price") is not None:
+            parts.append(
+                f"AI estimated price range: {constraints['min_price']:.2f} to {constraints['max_price']:.2f} "
+                f"{constraints.get('currency', 'USD')}. Lower-priced suitable matches are allowed."
+            )
+        if constraints.get("pricing_reasoning"):
+            parts.append(f"Pricing assumptions: {constraints['pricing_reasoning']}")
         if constraints.get("category"):
             parts.append(f"Category: {constraints['category']}")
         if constraints.get("deadline"):
@@ -562,15 +659,23 @@ def _generate_mock_products(
     query: str, category: str, max_price: float, currency: str,
 ) -> list[dict[str, Any]]:
     """Generate realistic mock products for demo purposes."""
-    random.seed(hash(query) % 2**32)
 
     templates: dict[str, list[dict[str, Any]]] = {
-        "electronics": [
+        "headphones": [
             {"name": "Sony WH-1000XM5 Wireless Headphones", "base_price": 348.00, "rating": 4.8},
             {"name": "Apple AirPods Pro (2nd Gen)", "base_price": 249.00, "rating": 4.7},
             {"name": "Samsung Galaxy Buds2 Pro", "base_price": 189.99, "rating": 4.5},
             {"name": "Bose QuietComfort 45", "base_price": 279.00, "rating": 4.6},
             {"name": "JBL Tune 770NC", "base_price": 99.95, "rating": 4.3},
+        ],
+        "power_banks": [
+            {"name": "Demo USB-C Portable Power Bank 20000mAh", "base_price": 39.99, "rating": 4.6, "capacity_mah": 20000},
+            {"name": "Demo Fast-Charge Portable Power Bank 26800mAh", "base_price": 49.99, "rating": 4.5, "capacity_mah": 26800},
+            {"name": "Demo High-Capacity Portable Power Bank 30000mAh", "base_price": 59.99, "rating": 4.4, "capacity_mah": 30000},
+        ],
+        "keyboards": [
+            {"name": "Demo Ergonomic Mechanical Keyboard with Quiet Switches", "base_price": 79.99, "rating": 4.5},
+            {"name": "Demo Wireless Mechanical Keyboard with Silent Switches", "base_price": 99.99, "rating": 4.6},
         ],
         "flights": [
             {"name": "Economy Round-trip — United Airlines", "base_price": 320.00, "rating": 4.0},
@@ -588,36 +693,62 @@ def _generate_mock_products(
         ],
         "general": [
             {"name": "Amazon Basics Backpack", "base_price": 45.00, "rating": 4.3},
-            {"name": "Kindle Paperwhite (16GB)", "base_price": 139.99, "rating": 4.7},
-            {"name": "Anker PowerCore 20000mAh", "base_price": 39.99, "rating": 4.6},
+            {"name": "Kindle Paperwhite (16GB)", "base_price": 139.99, "rating": 4.7, "category": "electronics"},
             {"name": "Hydro Flask 32oz Water Bottle", "base_price": 44.95, "rating": 4.8},
             {"name": "Moleskine Classic Notebook", "base_price": 19.50, "rating": 4.5},
         ],
     }
 
-    # Pick the best matching template
+    # Match the product family before applying broad category/budget filters.
+    # Electronics must not silently turn every query into a headphones search.
     category_lower = normalize_category(category) if category else "general"
-    template_key = "general"
-    for key in templates:
-        if key in category_lower or key in query.lower():
-            template_key = key
-            break
+    query_lower = query.lower().replace("-", " ")
+    aliases = {
+        "power_banks": ("power bank", "powerbank", "portable charger", "external battery", "powercore"),
+        "keyboards": ("keyboard",),
+        "headphones": ("headphone", "earbud", "earphone", "airpods", "headset"),
+        "flights": ("flight", "airline", "round trip", "airfare"),
+        "food": ("food", "meal", "snack", "coffee", "chocolate", "tea", "groceries"),
+    }
+    selected = [key for key, words in aliases.items() if any(
+        re.search(r"\b" + re.escape(word) + r"s?\b", query_lower) for word in words
+    )]
+    categories = {"headphones": "electronics", "power_banks": "electronics", "keyboards": "electronics"}
+    if not selected:
+        if normalize_category(query_lower.strip()) == category_lower:
+            selected = [key for key in templates if category_lower == "general" or
+                        category_allowed(category_lower, categories.get(key, key))]
+        else:
+            selected = ["general"]
+
+    capacity = re.search(r"(\d[\d,]*(?:\.\d+)?)\s*(k)?\s*mah", query_lower)
+    minimum_capacity = float(capacity[1].replace(",", "")) * (1000 if capacity[2] else 1) if capacity else 0
 
     products = []
-    for item in templates[template_key]:
-        # Slight price variation
-        price_variation = random.uniform(0.85, 1.15)
-        price = round(item["base_price"] * price_variation, 2)
+    candidates = [(key, item) for key in selected for item in templates[key]]
+    for template_key, item in candidates:
+        actual_category = item.get("category", categories.get(template_key, template_key))
+        if category_lower != "general" and not category_allowed(category_lower, actual_category):
+            continue
+        if template_key == "general" and normalize_category(query_lower.strip()) != category_lower:
+            if not any(word in query_lower for word in ("backpack", "kindle", "paperwhite", "water bottle", "hydro flask", "notebook", "moleskine")
+                       if word in item["name"].lower()):
+                continue
+        if template_key == "power_banks" and item["capacity_mah"] < minimum_capacity:
+            continue
+        # A demo item's price must not change just because the query is reworded.
+        price = item["base_price"]
 
         if price <= max_price:
             products.append({
                 "name": item["name"],
                 "price": price,
                 "currency": currency,
-                "category": template_key,
+                "category": actual_category,
                 "rating": item["rating"],
                 "in_stock": True,
                 "estimated_delivery": "3-5 business days",
+                **({"capacity_mah": item["capacity_mah"]} if "capacity_mah" in item else {}),
             })
 
     # Sort by price

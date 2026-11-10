@@ -69,6 +69,16 @@ class Query:
         self.args.extend(values)
         return self
 
+    def gt(self, column, value):
+        self.filters.append(f'"{column}" > ?')
+        self.args.append(value)
+        return self
+
+    def lte(self, column, value):
+        self.filters.append(f'"{column}" <= ?')
+        self.args.append(value)
+        return self
+
     def is_(self, column, value):
         assert value == "null"
         self.filters.append(f'"{column}" IS NULL')
@@ -100,10 +110,10 @@ class Query:
             rows = [dict(row) for row in cursor.fetchall()]
             self.sb.connection.commit()
         for row in rows:
-            for key in ("constraints", "details"):
+            for key in ("constraints", "details", "purchase_confirmation_product"):
                 if key in row and row[key] is not None:
                     row[key] = json.loads(row[key])
-            for key in ("cancel_requested", "is_active"):
+            for key in ("cancel_requested", "is_active", "purchase_confirmation_ready"):
                 if key in row:
                     row[key] = bool(row[key])
         return SimpleNamespace(data=(rows[0] if rows else None) if self.single else rows)

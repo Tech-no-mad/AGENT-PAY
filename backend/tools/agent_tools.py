@@ -43,7 +43,8 @@ AGENT_TOOLS: list[dict] = [
             "name": "check_mandate_policy",
             "description": (
                 "Verify whether a proposed purchase complies with the mandate's "
-                "spending constraints. Must be called BEFORE creating an order."
+                "spending constraints. Must be called BEFORE creating an order. "
+                "A rejection cancels the mandate immediately; no retries are allowed."
             ),
             "parameters": {
                 "type": "object",
@@ -54,7 +55,7 @@ AGENT_TOOLS: list[dict] = [
                     },
                     "price": {
                         "type": "number",
-                        "description": "Price of the item",
+                        "description": "Price of the item as a JSON number, never a quoted string",
                     },
                     "currency": {
                         "type": "string",
@@ -69,7 +70,7 @@ AGENT_TOOLS: list[dict] = [
                         "description": "Brief explanation of why this purchase fits the mandate",
                     },
                 },
-                "required": ["product_name", "price", "currency", "justification"],
+                "required": ["product_name", "price", "currency", "category", "justification"],
             },
         },
     },

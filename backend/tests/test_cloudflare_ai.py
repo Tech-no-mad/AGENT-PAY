@@ -150,7 +150,7 @@ def test_clock_refreshes_on_retries_and_later_requests_without_rewriting_history
 
 
 @pytest.mark.parametrize("response_format", ["flat", "nested", "both"])
-def test_agent_tool_history_has_matching_ids_and_function_objects(response_format):
+def test_agent_tool_history_has_matching_ids_and_function_objects(response_format, pricing_response):
     mandate = {
         "id": "mandate", "user_id": "buyer", "payment_token_id": "db-token",
         "description": "Find headphones under 150 USD",
@@ -162,7 +162,11 @@ def test_agent_tool_history_has_matching_ids_and_function_objects(response_forma
 
     def provider(request):
         payload = json.loads(request.content)
-        turn = len(requests)
+        if not requests:
+            assert "tools" not in payload
+            requests.append(payload)
+            return httpx.Response(200, json=pricing_response)
+        turn = len(requests) - 1
         requests.append(payload)
         calls = [call for message in payload["messages"] for call in message.get("tool_calls", [])]
         replies = [message for message in payload["messages"] if message["role"] == "tool"]
@@ -206,8 +210,8 @@ def test_agent_tool_history_has_matching_ids_and_function_objects(response_forma
             return await AgentOrchestrator(ai, paypal, database).execute_mandate(mandate)
 
     result = asyncio.run(execute())
-    assert result["error"] is None
-    assert result["agent_reasoning"] == "Search complete; no purchase made."
-    assert len(requests) == 3
+    assert result["error"] == "No purchase was authorized. Search complete; no purchase made."
+    assert result["agent_reasoning"] == result["error"]
+    assert len(requests) == 4
     paypal.create_authorized_order.assert_not_called()
     paypal.capture_authorization.assert_not_called()

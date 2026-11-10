@@ -4,6 +4,7 @@ import React from "react";
 import { useRouter } from "next/navigation";
 import { Clock, DollarSign } from "lucide-react";
 import StatusBadge from "./StatusBadge";
+import CancellationNotice from "./CancellationNotice";
 import type { Mandate } from "@/lib/api";
 import { formatTimestamp } from "@/lib/time";
 
@@ -36,6 +37,8 @@ export default function MandateCard({ mandate }: MandateCardProps) {
       <p className="text-gray-400 text-sm mb-4 line-clamp-2">
         {truncateDescription(mandate.description)}
       </p>
+
+      <CancellationNotice mandate={mandate} compact />
 
       <div className="flex items-center justify-between text-sm text-gray-500">
         <div className="flex items-center gap-1.5">

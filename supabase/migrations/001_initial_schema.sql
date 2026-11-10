@@ -89,6 +89,12 @@ create table public.mandates (
     executed_amount numeric(10,2),
     agent_reasoning text,          -- AI's decision explanation
 
+    purchase_confirmation_id uuid,
+    purchase_confirmation_status text check (purchase_confirmation_status in ('pending', 'approved', 'auto_approved', 'cancelled')),
+    purchase_confirmation_product jsonb,
+    purchase_confirmation_expires_at timestamptz,
+    purchase_confirmation_ready boolean not null default false,
+
     created_at timestamptz default now(),
     updated_at timestamptz default now(),
     expires_at timestamptz
@@ -121,6 +127,10 @@ create table public.transactions (
     event_type text not null
         check (event_type in (
             'mandate_created',
+            'constraints_defined',
+            'purchase_confirmation_requested',
+            'purchase_confirmation_approved',
+            'purchase_confirmation_auto_approved',
             'search_started',
             'deal_found',
             'policy_approved',

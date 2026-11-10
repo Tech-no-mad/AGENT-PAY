@@ -10,7 +10,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from backend.config import settings
-from backend.models.schemas import MandateCreate, MandateResponse, TransactionResponse
+from backend.models.schemas import MandateCreate, MandateResponse, PurchaseConfirmationDecision, TransactionResponse
 from backend.routes.auth import get_current_user
 from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.cloudflare_ai import CloudflareAI
@@ -19,6 +19,8 @@ from backend.services.paypal_service import PayPalService
 from backend.services.mandate_lifecycle import CancellationFailed, CancellationPending
 from backend.services.supabase_client import AuditLogError
 from backend.services.supabase_client import get_supabase
+from backend.services.purchase_confirmation import ConfirmationConflict
+from backend.services.time_utils import utc_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +54,9 @@ async def create_mandate(
     service: MandateService = Depends(get_mandate_service),
 ) -> dict[str, Any]:
     """
-    Create a new spending mandate. The natural language description is parsed
-    by Cloudflare AI into structured policy constraints, and the autonomous
-    agent is kicked off in the background.
+    Create a new spending mandate and start the background orchestrator.
+    Its first AI stage determines pricing, category, and policy constraints;
+    product search and payment only run after that decision is validated.
     """
     try:
         constraints_dict = payload.constraints.model_dump(exclude_unset=True, exclude_none=True) if payload.constraints else None
@@ -89,6 +91,32 @@ async def list_mandates(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to fetch mandates",
         )
+
+
+@router.get("/confirmations/pending", response_model=dict[str, Any])
+async def pending_confirmations(
+    current_user: dict[str, Any] = Depends(get_current_user),
+    service: MandateService = Depends(get_mandate_service),
+) -> dict[str, Any]:
+    mandates = await service.get_pending_confirmations(current_user["id"])
+    return {"mandates": mandates, "server_time": utc_timestamp()}
+
+
+@router.post("/{mandate_id}/confirmation", response_model=dict[str, Any])
+async def decide_purchase(
+    mandate_id: str, payload: PurchaseConfirmationDecision,
+    current_user: dict[str, Any] = Depends(get_current_user),
+    service: MandateService = Depends(get_mandate_service),
+) -> dict[str, Any]:
+    try:
+        mandate = await service.decide_purchase(mandate_id, current_user["id"], payload.confirmation_id, payload.decision)
+    except (ConfirmationConflict, CancellationPending) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (CancellationFailed, AuditLogError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not mandate:
+        raise HTTPException(status_code=404, detail="Mandate not found")
+    return mandate
 
 
 @router.get("/{mandate_id}", response_model=dict[str, Any])

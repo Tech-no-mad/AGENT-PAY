@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 from typing import Any, Optional
 
 import httpx
 from backend.models.schemas import ExtractedMandateConstraints
 from backend.services.categories import CATEGORIES
 from backend.services.time_utils import utc_now
+from backend.services.errors import error_message
 
 from backend.config import settings
 
@@ -23,8 +25,31 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF = [1.0, 2.0, 4.0]
 
 
+class CloudflareAIError(RuntimeError):
+    """All bounded attempts to obtain an AI response failed."""
+
+
 class ConstraintParseError(ValueError):
-    """Extraction failed; no mandate may be started with invented defaults."""
+    """AI constraints are invalid; shopping/payment must not proceed."""
+
+
+def parse_json_response(body: Any) -> Any:
+    """Read JSON from either Workers AI response shape, failing closed."""
+    if not isinstance(body, dict) or body.get("success") is False:
+        raise ValueError("AI provider returned an unsuccessful response")
+    result = body.get("result")
+    if isinstance(result, dict):
+        choices = result.get("choices") or []
+        message = (choices[0].get("message") or {}) if choices else {}
+        if message.get("tool_calls") or result.get("tool_calls"):
+            raise ValueError("Expected structured constraints, not tool calls")
+        result = message.get("content") or result.get("response")
+    if isinstance(result, str):
+        cleaned = result.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+        return json.loads(cleaned)
+    return result
 
 
 class CloudflareAI:
@@ -100,34 +125,28 @@ class CloudflareAI:
 
             except httpx.HTTPStatusError as exc:
                 last_error = exc
-                # Don't retry 4xx (except 429)
-                if exc.response.status_code == 429 or exc.response.status_code >= 500:
-                    wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
-                    logger.warning(
-                        "Cloudflare AI %s (attempt %d/%d) — retrying in %.1fs",
-                        exc.response.status_code,
-                        attempt + 1,
-                        _MAX_RETRIES,
-                        wait,
-                    )
-                    import asyncio
-                    await asyncio.sleep(wait)
-                else:
+                # Authentication/configuration errors should fail immediately.
+                if exc.response.status_code != 429 and exc.response.status_code < 500:
                     raise
-            except (httpx.ConnectError, httpx.ReadTimeout) as exc:
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, TimeoutError) as exc:
                 last_error = exc
+
+            if attempt + 1 < _MAX_RETRIES:
                 wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
                 logger.warning(
-                    "Cloudflare AI network error (attempt %d/%d): %s — retrying in %.1fs",
+                    "Cloudflare AI request failed (attempt %d/%d, %s): %s — retrying in %.1fs",
                     attempt + 1,
                     _MAX_RETRIES,
-                    exc,
+                    type(last_error).__name__,
+                    error_message(last_error),
                     wait,
                 )
-                import asyncio
                 await asyncio.sleep(wait)
 
-        raise RuntimeError(f"Cloudflare AI request failed after {_MAX_RETRIES} attempts: {last_error}")
+        raise CloudflareAIError(
+            f"Cloudflare AI could not return a response after {_MAX_RETRIES} attempts "
+            f"({type(last_error).__name__}): {error_message(last_error)}"
+        ) from last_error
 
     # ------------------------------------------------------------------
     # Mandate parsing helper
@@ -170,21 +189,7 @@ class CloudflareAI:
 
         try:
             result = await self.chat_with_tools(messages, tools=[])
-            if not isinstance(result, dict) or result.get("success") is False:
-                raise ValueError("Extraction provider returned an unsuccessful response")
-            response = result.get("result")
-            response_text = response.get("response") if isinstance(response, dict) else response
-
-            if isinstance(response_text, str):
-                # Strip markdown code fences if present
-                cleaned = response_text.strip()
-                if cleaned.startswith("```"):
-                    cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-                parsed = json.loads(cleaned)
-            else:
-                parsed = response_text
-
-            return ExtractedMandateConstraints.model_validate(parsed).model_dump()
+            return ExtractedMandateConstraints.model_validate(parse_json_response(result)).model_dump()
         except (ValueError, KeyError, TypeError, httpx.HTTPError, RuntimeError) as exc:
             logger.warning("Mandate extraction rejected: %s", type(exc).__name__)
             raise ConstraintParseError("Unable to safely parse spending constraints; review the instructions and retry") from exc

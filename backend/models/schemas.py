@@ -4,7 +4,7 @@ AgentPay Pydantic Models / Schemas.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
@@ -90,6 +90,12 @@ class MandateResponse(BaseModel):
     product_name: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class PurchaseConfirmationDecision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirmation_id: str = Field(..., min_length=1)
+    decision: Literal["continue", "cancel"]
 
 
 # ---------------------------------------------------------------------------

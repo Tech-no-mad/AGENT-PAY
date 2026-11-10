@@ -62,7 +62,7 @@ def test_request_scoped_services_cancel_the_same_process_worker_durably():
 
     async def scenario():
         waiting, resume = asyncio.Event(), asyncio.Event()
-        async def chat(*args):
+        async def chat(*args, **kwargs):
             waiting.set()
             await resume.wait()
             return {"result": {"response": "done"}}
