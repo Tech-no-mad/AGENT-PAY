@@ -23,10 +23,32 @@ As AI agents become capable of finding products, booking services, and negotiati
 **AgentPay** introduces **policy-guarded autonomous payments**:
 
 1. **User defines a mandate**: _"Find a flight SFO→JFK under $350, departing Friday, economy class. Book it instantly."_
-2. **AI agent searches** for matching deals using function calling
-3. **Policy engine validates** the deal against user-defined constraints
-4. **AUTHORIZE first**: PayPal holds funds without charging
-5. **CAPTURE or VOID**: Money only moves if every policy check passes
+2. **Pricing and category agent runs first**: AI estimates a price range and classifies the purchase, even when the user supplies no budget. The upper estimate becomes the spending ceiling; any stated budget is respected.
+3. **Shopping agent searches** for matching deals using the saved constraints
+4. **Policy engine validates** the deal against the spending ceiling, category, and other restrictions
+5. **AUTHORIZE first**: PayPal holds funds without charging
+6. **CAPTURE or VOID**: Money only moves if every policy check passes
+
+The creation form only needs purchase instructions and a saved payment method,
+with an optional auto-capture setting. The mandate detail page shows the AI's
+estimated range, category, and explanation. Pricing uses the configured Cloudflare
+model's knowledge; it is not a live market quote. Product search remains demo data.
+Invalid pricing output stops the background execution before search or payment.
+
+A rejected purchase policy ends the mandate immediately: the backend blocks all
+further approval/payment attempts and cancels it, voiding any existing hold.
+The AI cannot retry a rejected decision with corrected arguments or another item.
+
+After policy approval, the dashboard displays the selected product and price in
+a purchase confirmation popup. Continue releases the purchase immediately; Cancel
+stops the mandate. With no response, the backend continues automatically after
+10 seconds, even if the popup is closed by leaving the page. The countdown uses
+the server deadline and refreshes do not reset it. Disabling auto-capture still
+leaves the payment authorized for review rather than captured.
+
+Apply `supabase/migrations/004_purchase_confirmation.sql` after migrations 002
+and 003 before starting this backend. Restart all workers together so old workers
+cannot skip the confirmation gate. The popup is available on every dashboard page.
 
 > The agent **never** sees card numbers or PayPal passwords — it only holds a vault token.
 
@@ -94,6 +116,11 @@ initial schema and before starting the updated backend. Drain old background
 workers before deployment; do not mix workers that ignore cancellation with the
 new coordinator. See `backend/tests/README.md` for the cancellation/reconciliation
 runbook. Ship the repository's `shared/` directory with the backend and frontend.
+
+Also apply `supabase/migrations/003_ai_pricing_constraints.sql` before running this
+version. It enables the `constraints_defined` audit event. The first orchestrator
+stage saves the validated AI decision in the mandate's existing JSON constraints
+and audit trail before the shopping model is called.
 
 1. Go to [PayPal Developer Dashboard](https://developer.paypal.com/)
 2. Create a sandbox app → copy Client ID and Secret to `.env`

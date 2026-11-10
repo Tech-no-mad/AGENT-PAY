@@ -15,7 +15,7 @@ from backend.services import supabase_client as db
 from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.mandate_service import MandateService
 from backend.services.paypal_service import PayPalService
-from backend.services.mandate_lifecycle import PaymentOutcomeUnknown
+from backend.services.mandate_lifecycle import ExecutionStopped, PaymentOutcomeUnknown
 from backend.tests.fake_supabase import FakeSupabase
 
 
@@ -48,8 +48,9 @@ def purchase(**overrides):
     {"currency": "EUR"}, {"category": "food"}, {"category": ""},
 ])
 def test_authorization_rechecks_actual_purchase(agent, mandate, overrides):
-    response = run(agent._create_order(purchase(**overrides), mandate, {}))
-    assert "error" in response
+    with pytest.raises(ExecutionStopped):
+        run(agent._create_order(purchase(**overrides), mandate, {}))
+    assert agent.lifecycle.current(mandate["id"])["status"] == "cancelled"
     agent.paypal.create_authorized_order.assert_not_called()
 
 
@@ -57,13 +58,17 @@ def test_authorization_rechecks_actual_purchase(agent, mandate, overrides):
     {"deadline": "invalid"}, {"deadline": "2000-01-01T00:00:00Z"}])
 def test_invalid_or_expired_constraints_fail_closed(agent, mandate, constraint):
     mandate["constraints"].update(constraint)
-    assert "error" in run(agent._create_order(purchase(), mandate, {}))
+    with pytest.raises(ExecutionStopped):
+        run(agent._create_order(purchase(), mandate, {}))
+    assert agent.lifecycle.current(mandate["id"])["status"] == "cancelled"
     agent.paypal.create_authorized_order.assert_not_called()
 
 
 def test_changed_amount_after_policy_approval_is_rejected(agent, mandate):
     assert agent._check_policy({**purchase(), "price": 50}, mandate)["decision"] == "APPROVED"
-    assert "error" in run(agent._create_order(purchase(amount=150), mandate, {}))
+    with pytest.raises(ExecutionStopped):
+        run(agent._create_order(purchase(amount=150), mandate, {}))
+    assert agent.lifecycle.current(mandate["id"])["status"] == "cancelled"
     agent.paypal.create_authorized_order.assert_not_called()
 
 
@@ -119,10 +124,11 @@ def test_capture_requires_paypal_confirmation(agent, mandate, status, completed)
     assert agent.paypal.capture_authorization.call_args.kwargs["request_id"]
 
 
-def test_loop_does_not_complete_authorization_only_payment(agent, mandate):
+def test_loop_does_not_complete_authorization_only_payment(agent, mandate, pricing_response):
     mandate["constraints"]["auto_execute"] = False
     agent.sb.table("mandates").update({"constraints": mandate["constraints"]}).eq("id", mandate["id"]).execute()
     agent.ai.chat_with_tools.side_effect = [
+        pricing_response,
         {"result": {"tool_calls": [{"name": "create_authorized_order", "arguments": purchase()}]}},
         {"result": {"response": "Awaiting manual review"}},
     ]
@@ -262,7 +268,7 @@ def test_cancelled_mandate_aborts_orchestrator_execution_and_voids_authorization
     agent.paypal.void_authorization.assert_called_once_with("auth-hold-10")
 
 
-def test_create_mandate_merges_parsed_and_partial_explicit_constraints():
+def test_create_mandate_preserves_only_explicit_controls_for_background_planning():
     sb = FakeSupabase()
     orchestrator = SimpleNamespace(paypal=MagicMock(), execute_mandate=AsyncMock())
     ai = AsyncMock()
@@ -270,19 +276,21 @@ def test_create_mandate_merges_parsed_and_partial_explicit_constraints():
     service = MandateService(sb, orchestrator, ai)
     result = run(service.create_mandate("buyer", "Find a wireless keyboard under 100 dollars", "db-token",
                                       {"category": "general", "auto_execute": False}))
-    assert result["constraints"]["max_price"] == 99.99
     assert result["constraints"]["category"] == "general" and result["constraints"]["auto_execute"] is False
-    ai.parse_mandate.assert_awaited_once()
+    assert "max_price" not in result["constraints"]
+    ai.parse_mandate.assert_not_awaited()
 
 
-def test_mandate_creation_fails_closed_when_budget_cannot_be_parsed():
+def test_mandate_creation_accepts_instructions_without_a_budget():
     sb = FakeSupabase()
     ai = AsyncMock()
     ai.parse_mandate.return_value = {"category": "electronics"}
-    service = MandateService(sb, SimpleNamespace(paypal=MagicMock()), ai)
-    with pytest.raises(ValueError, match="positive budget"):
-        run(service.create_mandate("buyer", "Browse some laptops sometime", "db-token", None))
-    assert sb.table("mandates").select("*").execute().data == []
+    orchestrator = SimpleNamespace(paypal=MagicMock(), execute_mandate=AsyncMock())
+    service = MandateService(sb, orchestrator, ai)
+    created = run(service.create_mandate("buyer", "Find a laptop", "db-token", None))
+    assert created["constraints"] == {}
+    ai.parse_mandate.assert_not_awaited()
+    orchestrator.execute_mandate.assert_awaited_once()
 
 
 def test_cloudflare_ai_parse_mandate_fails_closed_on_invalid_json():

@@ -106,6 +106,7 @@ class AuditLogError(RuntimeError):
 
 
 _EVENT_NAMES = {
+    "CONSTRAINTS_DEFINED": "constraints_defined",
     "MANDATE_CREATED": "mandate_created", "PRODUCT_SEARCH": "search_started",
     "ORDER_CREATED": "order_created", "ORDER_AUTHORIZED": "authorized",
     "PAYMENT_AUTHORIZED": "authorized", "PAYMENT_CAPTURED": "captured",
@@ -116,7 +117,8 @@ _EVENT_NAMES = {
     "SEARCH_PRODUCTS": "search_started", "SEARCHING": "search_started",
     "CAPTURE_DECLINED": "failed", "ERROR": "failed",
 }
-_SCHEMA_EVENTS = {"mandate_created", "search_started", "deal_found", "policy_approved", "policy_rejected",
+_SCHEMA_EVENTS = {"mandate_created", "constraints_defined", "search_started", "deal_found", "policy_approved", "policy_rejected",
+                  "purchase_confirmation_requested", "purchase_confirmation_approved", "purchase_confirmation_auto_approved",
                   "order_created", "authorized", "captured", "voided", "failed", "refunded"}
 
 

@@ -1,4 +1,4 @@
-"""One category vocabulary shared by the form, extraction, search and policy."""
+"""One category vocabulary shared by AI planning, display, search and policy."""
 
 import json
 from pathlib import Path

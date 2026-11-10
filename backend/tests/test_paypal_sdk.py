@@ -125,7 +125,7 @@ def test_order_model_error_is_failed_without_leaving_a_payment_in_flight(sandbox
     assert stored["payment_operation"] is None
     assert stored["payment_started_at"] is None
     assert stored["paypal_order_id"] is None
-    audit = sandbox.agent.sb.table("transactions").select("*").execute().data
+    audit = sandbox.agent.sb.table("transactions").select("*").eq("event_type", "failed").execute().data
     assert len(audit) == 1
     assert audit[0]["details"]["status"] == "failed"
     assert audit[0]["details"]["original_event"] == "ORDER_FAILED"
@@ -141,5 +141,5 @@ def test_error_after_sending_order_still_requires_reconciliation(sandbox, failur
     stored = sandbox.agent.lifecycle.current("mandate")
     assert stored["payment_operation_id"]
     assert stored["payment_operation"] == "authorize"
-    audit = sandbox.agent.sb.table("transactions").select("*").execute().data
+    audit = sandbox.agent.sb.table("transactions").select("*").eq("event_type", "failed").execute().data
     assert audit[0]["details"]["status"] == "unknown"

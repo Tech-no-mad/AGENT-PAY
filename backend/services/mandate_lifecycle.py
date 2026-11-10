@@ -45,7 +45,7 @@ class MandateLifecycle:
             raise ExecutionStopped(row)
         return row
 
-    def claim(self, mandate_id: str, operation: str) -> dict[str, Any]:
+    def claim(self, mandate_id: str, operation: str, *, confirmation_id: str | None = None) -> dict[str, Any]:
         allowed = {"authorize": ["active", "searching", "evaluating"], "capture": ["authorized"],
                    "void": ["active", "searching", "evaluating", "authorized", "failed"]}[operation]
         query = (self.sb.table("mandates").update({
@@ -54,6 +54,10 @@ class MandateLifecycle:
         }).eq("id", mandate_id).in_("status", allowed).is_("payment_operation_id", "null"))
         if operation != "void":
             query = query.eq("cancel_requested", False)
+        if operation == "authorize" and confirmation_id:
+            query = (query.eq("purchase_confirmation_id", confirmation_id)
+                     .in_("purchase_confirmation_status", ["approved", "auto_approved"])
+                     .eq("purchase_confirmation_ready", True))
         rows = query.execute().data
         if rows:
             return rows[0]
@@ -83,13 +87,21 @@ class MandateLifecycle:
         self.checkpoint(claim, agent_reasoning=reason)
         raise PaymentOutcomeUnknown(reason)
 
-    def cancel(self, mandate_id: str, user_id: str) -> dict[str, Any]:
-        rows = (self.sb.table("mandates").update({"cancel_requested": True})
+    def request_cancel(self, mandate_id: str, user_id: str, *, reason: str | None = None) -> dict[str, Any]:
+        """Persist the stop flag before auditing or releasing any operation claim."""
+        fields: dict[str, Any] = {"cancel_requested": True}
+        if reason:
+            fields["agent_reasoning"] = reason
+        rows = (self.sb.table("mandates").update(fields)
                 .eq("id", mandate_id).eq("user_id", user_id)
                 .in_("status", ["active", "searching", "evaluating", "authorized", "failed"]).execute()).data
         current = rows[0] if rows else self.current(mandate_id)
         if current["user_id"] != user_id:
             raise ValueError("Mandate does not belong to this user")
+        return current
+
+    def cancel(self, mandate_id: str, user_id: str, *, reason: str | None = None) -> dict[str, Any]:
+        current = self.request_cancel(mandate_id, user_id, reason=reason)
         if current["status"] in ("completed", "cancelled"):
             return current
         if current.get("payment_operation_id"):
@@ -116,10 +128,14 @@ class MandateLifecycle:
                                     paypal_authorization_id=authorization_id, status="void_failed",
                                     details={"action": "cancel", "error": str(exc), "retryable": True})
                     raise CancellationFailed("PayPal could not confirm release of funds; cancellation remains pending. Retry") from exc
-        updated = self.finish(claim, status="cancelled", agent_reasoning="Cancellation confirmed; any authorization has been voided")
+        explanation = "Cancellation confirmed; any authorization has been voided"
+        if reason:
+            explanation = f"{reason}. {explanation}"
+        updated = self.finish(claim, status="cancelled", agent_reasoning=explanation)
         if authorization_id:
             log_transaction(mandate_id, "AUTHORIZATION_VOIDED", user_id=user_id, supabase_client=self.sb,
                             paypal_authorization_id=authorization_id, status="voided")
         log_transaction(mandate_id, "MANDATE_CANCELLED", user_id=user_id, supabase_client=self.sb,
-                        status="cancelled", details={"had_authorization": bool(authorization_id)})
+                        status="cancelled", details={"had_authorization": bool(authorization_id),
+                                                     **({"reason": reason} if reason else {})})
         return updated

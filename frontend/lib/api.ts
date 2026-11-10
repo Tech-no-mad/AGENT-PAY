@@ -107,6 +107,8 @@ export async function getMe(token?: string) {
 // ----------------------------------------------------------------------
 
 export interface MandateConstraints {
+  min_price?: number;
+  pricing_reasoning?: string;
   max_price?: number;
   currency?: string;
   category?: string;
@@ -131,6 +133,11 @@ export interface Mandate {
     | string;
   constraints?: MandateConstraints | Record<string, any>;
   agent_reasoning?: string;
+  cancel_requested?: boolean;
+  purchase_confirmation_id?: string;
+  purchase_confirmation_status?: "pending" | "approved" | "auto_approved" | "cancelled";
+  purchase_confirmation_expires_at?: string;
+  purchase_confirmation_product?: { product_name: string; price: number; currency: string; category: string };
   paypal_order_id?: string;
   paypal_authorization_id?: string;
   executed_amount?: number;
@@ -168,6 +175,18 @@ export async function cancelMandate(
   return apiFetch<Mandate>(`/mandates/${id}/cancel`, {
     method: "POST",
     token,
+  });
+}
+
+export async function getPendingPurchaseConfirmations(): Promise<{ mandates: Mandate[]; server_time: string }> {
+  return apiFetch("/mandates/confirmations/pending");
+}
+
+export async function decidePurchase(
+  mandateId: string, confirmationId: string, decision: "continue" | "cancel"
+): Promise<Mandate> {
+  return apiFetch(`/mandates/${mandateId}/confirmation`, {
+    method: "POST", body: JSON.stringify({ confirmation_id: confirmationId, decision }),
   });
 }
 

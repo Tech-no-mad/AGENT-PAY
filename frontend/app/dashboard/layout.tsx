@@ -16,6 +16,7 @@ import {
   User,
 } from "lucide-react";
 import { logout } from "@/lib/api";
+import PurchaseConfirmationDialog from "@/components/PurchaseConfirmationDialog";
 
 const navItems = [
   { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -75,6 +76,7 @@ export default function DashboardLayout({
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 flex">
+      <PurchaseConfirmationDialog />
       {/* Desktop Sidebar */}
       <aside className="hidden md:flex flex-col w-64 border-r border-gray-800 bg-gray-900/50 backdrop-blur-sm">
         {/* Logo */}

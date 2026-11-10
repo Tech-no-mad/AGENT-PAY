@@ -106,16 +106,20 @@ def test_valid_extraction_preserves_all_restrictions():
 
 
 def service_for(database, parsed):
-    orchestrator = SimpleNamespace(paypal=MagicMock(), execute_mandate=AsyncMock())
-    ai = SimpleNamespace(parse_mandate=AsyncMock(return_value=parsed))
+    plan = {"min_price": 40, "pricing_reasoning": "Estimated headphones pricing.", **parsed}
+    ai = SimpleNamespace(chat_with_tools=AsyncMock(side_effect=[
+        {"result": {"response": json.dumps(plan)}}, {"result": {"response": "No matching product."}},
+    ]))
+    orchestrator = AgentOrchestrator(ai, MagicMock(), database)
+    orchestrator.execute_mandate = AsyncMock(wraps=orchestrator.execute_mandate)
     return MandateService(database, orchestrator, ai)
 
 
 def create_and_wait(service, constraints):
     async def work():
         row = await service.create_mandate("buyer", "Headphones under $150", "db-token", constraints)
-        await asyncio.sleep(0)
-        return row
+        await service._active_tasks[row["id"]]
+        return service.lifecycle.current(row["id"])
     return asyncio.run(work())
 
 
@@ -134,13 +138,13 @@ def test_partial_ui_constraints_do_not_drop_description_limits():
 
 
 def test_explicit_limits_override_parsed_values_and_null_does_not_clear_restrictions():
-    row = create_and_wait(service_for(FakeSupabase(), extracted()), {"max_price": 75, "currency": "USD", "deadline": None})
+    row = create_and_wait(service_for(FakeSupabase(), extracted(currency="USD")), {"max_price": 75, "currency": "USD", "deadline": None})
     assert row["constraints"]["max_price"] == 75 and row["constraints"]["currency"] == "USD"
     assert row["constraints"]["auto_execute"] is False and row["constraints"]["deadline"]
 
 
-def test_explicit_budget_can_complete_valid_extraction_with_no_instruction_budget():
-    row = create_and_wait(service_for(FakeSupabase(), extracted(max_price=None)), {"max_price": 75})
+def test_explicit_budget_tightens_ai_estimate():
+    row = create_and_wait(service_for(FakeSupabase(), extracted()), {"max_price": 75})
     assert row["constraints"]["max_price"] == 75
 
 
@@ -149,7 +153,7 @@ def test_expired_purchase_deadline_does_not_insert_or_start_a_worker():
     expired = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     service = service_for(database, extracted(deadline=expired))
     with pytest.raises(ValueError, match="deadline has already passed"):
-        create_and_wait(service, {})
+        create_and_wait(service, {"deadline": expired})
     assert database.table("mandates").select("*").execute().data == []
     service.orchestrator.execute_mandate.assert_not_awaited()
 
@@ -171,15 +175,15 @@ def test_route_passes_only_explicit_fields_for_merge():
 
 
 @pytest.mark.parametrize("failure", ["parse", "missing_budget"])
-def test_invalid_constraints_never_insert_or_start_a_worker(failure):
+def test_invalid_ai_constraints_fail_the_worker_before_shopping(failure):
     database = FakeSupabase()
     service = service_for(database, extracted(max_price=None))
     if failure == "parse":
-        service.ai.parse_mandate.side_effect = ConstraintParseError("invalid")
-    with pytest.raises(ValueError):
-        create_and_wait(service, {"category": "product"})
-    assert database.table("mandates").select("*").execute().data == []
-    service.orchestrator.execute_mandate.assert_not_awaited()
+        service.ai.chat_with_tools.side_effect = ConstraintParseError("invalid")
+    row = create_and_wait(service, {"category": "product"})
+    assert row["status"] == "failed"
+    assert service.ai.chat_with_tools.await_count == 1
+    service.orchestrator.paypal.create_authorized_order.assert_not_called()
 
 
 @pytest.mark.parametrize("required,actual,allowed", [("product", "electronics", True), ("physical_goods", "general", True),
@@ -207,7 +211,7 @@ def test_cancellation_while_ai_is_waiting_blocks_all_later_payment_tools(databas
 
     async def scenario():
         waiting, resume = asyncio.Event(), asyncio.Event()
-        async def chat(*args):
+        async def chat(*args, **kwargs):
             waiting.set()
             await resume.wait()
             return {"result": {"tool_calls": [
@@ -261,17 +265,17 @@ def test_cancellation_after_order_creation_prevents_explicit_authorization(datab
     paypal.capture_authorization.assert_not_called()
 
 
-def test_audit_failure_does_not_hide_a_confirmed_charge_or_repeat_payment(database, mandate):
+def test_audit_failure_does_not_hide_a_confirmed_charge_or_repeat_payment(database, mandate, pricing_response):
     paypal = MagicMock()
     paypal.create_authorized_order.return_value = {"id": "order", "status": "COMPLETED", "purchase_units": [
         {"payments": {"authorizations": [{"id": "auth"}]}}]}
     paypal.capture_authorization.return_value = {"id": "capture", "status": "COMPLETED"}
-    ai = SimpleNamespace(chat_with_tools=AsyncMock(return_value={"result": {"tool_calls": [
+    ai = SimpleNamespace(chat_with_tools=AsyncMock(side_effect=[pricing_response, {"result": {"tool_calls": [
         {"name": "create_authorized_order", "arguments": {"amount": 50, "currency": "USD", "category": "electronics"}},
         {"name": "capture_authorized_payment", "arguments": {"authorization_id": "auth"}},
-    ]}}))
+    ]}}]))
     def audit(*args, **kwargs):
-        if args[1] == "PAYMENT_CAPTURED":
+        if (args[1] if len(args) > 1 else kwargs.get("event_type")) == "PAYMENT_CAPTURED":
             raise AuditLogError("database unavailable")
         return log_transaction(*args, **kwargs)
     agent = AgentOrchestrator(ai, paypal, database)

@@ -12,7 +12,9 @@ from backend.models.schemas import MandateConstraints
 
 from backend.services.agent_orchestrator import AgentOrchestrator
 from backend.services.cloudflare_ai import CloudflareAI
+from backend.services.errors import error_message
 from backend.services.mandate_lifecycle import CancellationFailed, CancellationPending, MandateLifecycle
+from backend.services.purchase_confirmation import PurchaseConfirmation
 from backend.services.supabase_client import AuditLogError, log_transaction, update_mandate_status, resolve_payment_token
 from backend.services.time_utils import parse_utc_timestamp, utc_now
 
@@ -50,17 +52,14 @@ class MandateService:
         constraints: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
-        Parse instructions, merge explicit overrides, validate the mandate,
-        and kick off the agent execution in the background.
+        Save explicit controls and start the orchestrator. Its first AI stage
+        defines the price range, category, and remaining purchase constraints.
         """
         resolve_payment_token(self.sb, payment_token_id, user_id)
 
-        parsed = await self.ai.parse_mandate(description)
         constraints = MandateConstraints.model_validate({
-            **parsed, **{key: value for key, value in (constraints or {}).items() if value is not None},
-        }).model_dump()
-        if constraints["max_price"] is None:
-            raise ValueError("A positive budget is required in the instructions or explicit constraints")
+            key: value for key, value in (constraints or {}).items() if value is not None
+        }).model_dump(exclude_unset=True, exclude_none=True)
         deadline = constraints.get("deadline")
         if deadline and parse_utc_timestamp(deadline) <= utc_now():
             raise ValueError("Purchase deadline has already passed; provide a future deadline")
@@ -104,7 +103,7 @@ class MandateService:
             update_mandate_status(
                 mandate.get("id", ""),
                 "failed",
-                {"agent_reasoning": f"Background execution error: {exc}"},
+                {"agent_reasoning": f"Background execution error: {error_message(exc)}"},
                 supabase_client=self.sb,
             )
         finally:
@@ -149,6 +148,17 @@ class MandateService:
             raise
         self._stop_local_task(mandate_id)
         return cancelled
+
+    async def get_pending_confirmations(self, user_id: str) -> list[dict[str, Any]]:
+        return (self.sb.table("mandates").select("*").eq("user_id", user_id)
+                .eq("purchase_confirmation_status", "pending").eq("cancel_requested", False)
+                .in_("status", ["active", "searching", "evaluating"])
+                .order("purchase_confirmation_expires_at").execute()).data or []
+
+    async def decide_purchase(self, mandate_id: str, user_id: str, confirmation_id: str, decision: str) -> Optional[dict[str, Any]]:
+        if not await self.get_mandate(mandate_id, user_id):
+            return None
+        return PurchaseConfirmation(self.lifecycle).decide(mandate_id, user_id, confirmation_id, decision)
 
     def _stop_local_task(self, mandate_id: str) -> None:
         task = self._active_tasks.get(mandate_id)

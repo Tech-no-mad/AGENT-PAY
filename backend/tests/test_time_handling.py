@@ -8,7 +8,7 @@ import pytest
 
 from backend.models.schemas import MandateConstraints
 from backend.services.agent_orchestrator import AgentOrchestrator
-from backend.services.mandate_lifecycle import MandateLifecycle
+from backend.services.mandate_lifecycle import ExecutionStopped, MandateLifecycle
 from backend.services.supabase_client import log_transaction, update_mandate_status
 from backend.services.time_utils import parse_utc_timestamp, utc_now, utc_timestamp
 from backend.tests.fake_supabase import FakeSupabase
@@ -93,13 +93,17 @@ def test_capture_rechecks_stored_deadline_after_authorization(deadline_kind):
     execution = {"status": "authorized", "authorization_id": "owned-auth", "amount": 100, "currency": "USD"}
     with patch("backend.services.time_utils.datetime", wraps=datetime) as clock:
         clock.now.return_value = now
-        response = asyncio.run(agent._capture({"authorization_id": "owned-auth"}, mandate, execution))
+        if deadline_kind == "future":
+            response = asyncio.run(agent._capture({"authorization_id": "owned-auth"}, mandate, execution))
+        else:
+            with pytest.raises(ExecutionStopped):
+                asyncio.run(agent._capture({"authorization_id": "owned-auth"}, mandate, execution))
     current = agent.lifecycle.current(mandate["id"])
     assert current["payment_operation_id"] is None
     if deadline_kind == "future":
         assert response["status"] == "CAPTURED"
         paypal.capture_authorization.assert_called_once()
     else:
-        assert "error" in response
-        assert current["status"] == execution["status"] == "authorized"
+        assert current["status"] == execution["status"] == "cancelled"
+        paypal.void_authorization.assert_called_once_with("owned-auth")
         paypal.capture_authorization.assert_not_called()

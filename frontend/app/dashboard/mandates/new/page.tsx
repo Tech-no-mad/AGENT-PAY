@@ -9,16 +9,14 @@ import {
   AlertTriangle,
   ArrowRight,
   Shield,
-  HelpCircle,
 } from "lucide-react";
 import { createMandate, getVaultTokens, VaultToken } from "@/lib/api";
-import purchaseCategories from "@shared/purchase_categories.json";
 
 const PROMPT_SUGGESTIONS = [
-  "Find noise-cancelling wireless headphones under $150 with 4+ star rating and order them.",
-  "Book a round-trip flight SFO to JFK under $350 departing this Friday economy class.",
-  "Order an ergonomic mechanical keyboard with quiet switches under $120.",
-  "Find a high-capacity portable power bank (20000mAh+) under $45 and purchase it.",
+  "Find noise-cancelling wireless headphones with a 4+ star rating and order them.",
+  "Book a round-trip flight SFO to JFK departing this Friday, economy class.",
+  "Order an ergonomic mechanical keyboard with quiet switches.",
+  "Find a high-capacity portable power bank (20000mAh+) and purchase it.",
 ];
 
 export default function NewMandatePage() {
@@ -28,9 +26,7 @@ export default function NewMandatePage() {
 
   const [description, setDescription] = useState("");
   const [selectedTokenId, setSelectedTokenId] = useState("");
-  const [maxPrice, setMaxPrice] = useState<string>("");
   const [autoExecute, setAutoExecute] = useState(true);
-  const [category, setCategory] = useState("physical_goods");
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -74,8 +70,6 @@ export default function NewMandatePage() {
         description: description.trim(),
         payment_token_id: selectedTokenId,
         constraints: {
-          max_price: maxPrice ? parseFloat(maxPrice) : undefined,
-          category,
           auto_execute: autoExecute,
         },
       });
@@ -96,9 +90,8 @@ export default function NewMandatePage() {
           Create Autonomous Spending Mandate
         </h1>
         <p className="text-gray-400 text-sm mt-1">
-          Instruct your AI shopping agent with natural language. The agent will parse your
-          instructions, respect spending ceilings, hold pre-authorization funds, and only capture
-          upon policy approval.
+          Describe what you want. AI will determine the price range and category first,
+          then find an option within its spending ceiling and check the purchase policy.
         </p>
       </div>
 
@@ -137,7 +130,7 @@ export default function NewMandatePage() {
             rows={4}
             value={description}
             onChange={(e) => setDescription(e.target.value)}
-            placeholder="e.g. Find noise-cancelling headphones under $150 and order them immediately if ratings are above 4 stars."
+            placeholder="e.g. Find noise-cancelling headphones with ratings above 4 stars and order them."
             className="w-full bg-gray-950 border border-gray-800 rounded-lg p-3 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-primary-500 transition-colors"
           />
 
@@ -161,7 +154,7 @@ export default function NewMandatePage() {
           </div>
         </div>
 
-        {/* Payment Method & Hard Constraints */}
+        {/* Payment Method & AI Planning */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {/* Payment Method Selector */}
           <div className="p-6 rounded-xl border border-gray-800 bg-gray-900/40 space-y-4">
@@ -200,38 +193,26 @@ export default function NewMandatePage() {
             </p>
           </div>
 
-          {/* Explicit Constraints */}
+          {/* AI-managed pricing and category */}
           <div className="p-6 rounded-xl border border-gray-800 bg-gray-900/40 space-y-4">
-            <label className="block text-sm font-medium text-gray-200">
-              Explicit Policy Controls (Optional)
-            </label>
+            <h2 className="text-sm font-medium text-gray-200 flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-primary-400" />
+              AI Pricing & Category
+            </h2>
 
             <div className="space-y-3">
-              <div>
-                <span className="text-xs text-gray-400 block mb-1">Max Spending Cap (USD)</span>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="1"
-                  placeholder="e.g. 150.00"
-                  value={maxPrice}
-                  onChange={(e) => setMaxPrice(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-1.5 text-sm text-gray-200 placeholder-gray-500 focus:outline-none focus:border-primary-500"
-                />
-              </div>
-
-              <div>
-                <span className="text-xs text-gray-400 block mb-1">Category</span>
-                <select
-                  value={category}
-                  onChange={(e) => setCategory(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-lg px-3 py-1.5 text-sm text-gray-200 focus:outline-none focus:border-primary-500"
-                >
-                  {Object.entries(purchaseCategories).map(([value, definition]) => (
-                    <option key={value} value={value}>{definition.label}</option>
-                  ))}
-                </select>
-              </div>
+              <p className="text-xs text-gray-400 leading-relaxed">
+                The first agent estimates a suitable price range and selects the category
+                from your instructions. Its upper estimate becomes the spending ceiling.
+                You can view the estimate and reasoning after launch.
+              </p>
+              <p className="text-xs text-gray-500">
+                Any budget mentioned in your instructions is respected. Estimates are not live quotes.
+              </p>
+              <p className="text-xs text-gray-400">
+                Before payment, a popup shows the product and price. Choose Continue or Cancel;
+                with no response, the purchase continues automatically after 10 seconds.
+              </p>
 
               <div className="flex items-center gap-2 pt-1">
                 <input

@@ -17,7 +17,9 @@ import {
 } from "lucide-react";
 import StatusBadge from "@/components/StatusBadge";
 import AgentActivityLog from "@/components/AgentActivityLog";
+import CancellationNotice from "@/components/CancellationNotice";
 import { formatTimestamp } from "@/lib/time";
+import purchaseCategories from "@shared/purchase_categories.json";
 import {
   cancelMandate,
   getMandate,
@@ -55,6 +57,8 @@ export default function MandateDetailPage() {
 
   useEffect(() => {
     fetchData();
+    const refresh = () => { void fetchData(); };
+    window.addEventListener("mandate-updated", refresh);
 
     // Auto-polling while the agent is running
     const interval = setInterval(() => {
@@ -66,7 +70,10 @@ export default function MandateDetailPage() {
       }
     }, 3000);
 
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("mandate-updated", refresh);
+    };
   }, [fetchData, mandate?.status]);
 
   const handleCancel = async () => {
@@ -113,6 +120,11 @@ export default function MandateDetailPage() {
   const isOngoing = ["active", "searching", "evaluating", "authorized"].includes(
     mandate.status
   );
+  const constraints = mandate.constraints;
+  const hasPriceRange = typeof constraints?.min_price === "number" && typeof constraints?.max_price === "number";
+  const category = typeof constraints?.category === "string" ? constraints.category : "";
+  const categoryLabel = purchaseCategories[category as keyof typeof purchaseCategories]?.label || category;
+  const formatPrice = (amount: number) => `${constraints?.currency || "USD"} ${amount.toFixed(2)}`;
 
   return (
     <div className="max-w-6xl mx-auto space-y-8">
@@ -162,6 +174,8 @@ export default function MandateDetailPage() {
         </div>
       </div>
 
+      <CancellationNotice mandate={mandate} transactions={transactions} />
+
       {/* Main Instruction Banner */}
       <div className="p-6 rounded-xl border border-gray-800 bg-gray-900/40 space-y-2">
         <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">
@@ -203,9 +217,9 @@ export default function MandateDetailPage() {
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="text-2xl font-bold text-gray-100">
-            {mandate.constraints && typeof mandate.constraints === "object" && (mandate.constraints as any).max_price
-              ? `$${(mandate.constraints as any).max_price.toFixed(2)}`
-              : "No Ceiling"}
+            {typeof constraints?.max_price === "number"
+              ? formatPrice(constraints.max_price)
+              : isOngoing ? "AI is estimating..." : "Not determined"}
           </div>
           <div className="text-[11px] text-gray-500">
             Autonomous agent will reject any deal above this limit
@@ -245,27 +259,45 @@ export default function MandateDetailPage() {
           ) : isOngoing ? (
             <div className="p-4 rounded-lg bg-gray-950 border border-gray-800 text-xs text-gray-400 flex items-center gap-2.5">
               <RefreshCw className="w-4 h-4 animate-spin text-primary-400" />
-              <span>Cloudflare AI is currently evaluating merchant options...</span>
+              <span>{hasPriceRange ? "AI is evaluating merchant options..." : "AI is determining the price range and category..."}</span>
             </div>
           ) : (
             <div className="text-xs text-gray-500">No reasoning recorded.</div>
           )}
         </div>
 
-        {/* Right: Parsed Policy Constraints */}
+        {/* Right: AI pricing decision */}
         <div className="p-6 rounded-xl border border-gray-800 bg-gray-900/50 space-y-4">
           <h3 className="text-sm font-semibold text-gray-200 flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            Parsed Policy Constraints
+            AI Price Range & Category
           </h3>
 
-          <div className="p-4 rounded-lg bg-gray-950 border border-gray-800 font-mono text-xs text-gray-300 overflow-x-auto">
-            <pre>
-              {mandate.constraints
-                ? JSON.stringify(mandate.constraints, null, 2)
-                : "{}"}
-            </pre>
-          </div>
+          {hasPriceRange ? (
+            <div className="space-y-3 text-sm">
+              <p className="text-xl font-semibold text-gray-100">
+                {formatPrice(constraints!.min_price)} – {formatPrice(constraints!.max_price)}
+              </p>
+              <p className="text-primary-300">{categoryLabel}</p>
+              <p className="text-gray-400 leading-relaxed">{constraints?.pricing_reasoning}</p>
+              <p className="text-xs text-gray-500">AI estimate. The upper end is the purchase ceiling; lower-priced matches are allowed.</p>
+            </div>
+          ) : (
+            <p className="text-sm text-gray-400">
+              {isOngoing ? "The pricing agent runs before product search. Its decision will appear here." : "No AI price range was recorded."}
+            </p>
+          )}
+          {constraints?.deadline && (
+            <p className="text-xs text-gray-400">Purchase by: {formatTimestamp(constraints.deadline)}</p>
+          )}
+          {constraints?.additional_rules && (
+            <p className="text-xs text-gray-400">Requirements: {constraints.additional_rules}</p>
+          )}
+          {typeof constraints?.auto_execute === "boolean" && (
+            <p className="text-xs text-gray-400">
+              {constraints.auto_execute ? "Automatically capture after policy approval." : "Hold authorization for review before capture."}
+            </p>
+          )}
         </div>
       </div>
 
