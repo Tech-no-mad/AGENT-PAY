@@ -57,16 +57,19 @@ app = FastAPI(
 )
 
 # CORS configuration
-origins = [
-    settings.FRONTEND_URL,
+configured_origins = [o.strip() for o in settings.FRONTEND_URL.split(",") if o.strip()]
+origins = list(set([
+    *configured_origins,
+    "https://agent-pay-black.vercel.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:8000",
-]
+]))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"^https:\/\/.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
